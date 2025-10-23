@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Monitoring Options API - Documentation</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+        }
+        .loading {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            flex-direction: column;
+            background: #1a1a1a;
+            color: #fff;
+        }
+        .loading-spinner {
+            border: 4px solid #333;
+            border-top: 4px solid #9333ea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin-bottom: 20px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .error {
+            background: #ef4444;
+            color: white;
+            padding: 20px;
+            margin: 20px;
+            border-radius: 8px;
+        }
+        .info {
+            background: #3b82f6;
+            color: white;
+            padding: 20px;
+            margin: 20px;
+            border-radius: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="loading" id="loading">
+        <div class="loading-spinner"></div>
+        <p>Carregando documentação da API...</p>
+        <small style="color: #888;">Se demorar muito, verifique se o servidor está rodando em http://localhost:8000</small>
+    </div>
+
+    <!-- Scalar API Reference -->
+    <script
+        id="api-reference"
+        data-url="http://localhost:8000/api/docs/openapi.json"
+    ></script>
+
+    <!-- Latest Scalar version from CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+
+    <script>
+        // Check if server is running
+        fetch('http://localhost:8000/health')
+            .then(response => {
+                if (response.ok) {
+                    console.log('✓ Server is running');
+                    document.getElementById('loading').style.display = 'none';
+                } else {
+                    throw new Error('Server returned error');
+                }
+            })
+            .catch(error => {
+                console.error('✗ Server is not running:', error);
+                document.getElementById('loading').innerHTML = `
+                    <div class="error">
+                        <h2>⚠️ Servidor não está rodando</h2>
+                        <p>Não foi possível conectar ao servidor em http://localhost:8000</p>
+                        <p><strong>Solução:</strong></p>
+                        <ol style="text-align: left; max-width: 600px;">
+                            <li>Abra um terminal</li>
+                            <li>Execute: <code>cd backend</code></li>
+                            <li>Execute: <code>python -m app.main</code></li>
+                            <li>Aguarde o servidor iniciar</li>
+                            <li>Recarregue esta página</li>
+                        </ol>
+                    </div>
+                `;
+            });
+
+        // Log when Scalar is ready
+        document.addEventListener('DOMContentLoaded', function() {
+            console.log('📚 Scalar API Reference initialized');
+            console.log('🌐 OpenAPI Spec URL: http://localhost:8000/api/docs/openapi.json');
+        });
+
+        // Optional: Handle errors
+        window.addEventListener('error', function(e) {
+            console.error('Error loading Scalar:', e);
+        });
+    </script>
+</body>
+</html>

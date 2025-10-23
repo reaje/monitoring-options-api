@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tree:*)",
+      "Bash(pip install:*)",
+      "Bash(playwright install:*)",
+      "Bash(python run_e2e_tests.py:*)",
+      "Bash(pytest:*)",
+      "Bash(python test_e2e_simple.py:*)",
+      "Bash(python app/main.py:*)",
+      "Bash(python -m app.main:*)",
+      "Bash(python:*)",
+      "Bash(git add:*)",
+      "Bash(git init:*)",
+      "Bash(git config:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
