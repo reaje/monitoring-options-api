@@ -1,0 +1,46 @@
+; Arquivo de configuração de exemplo para VentryBridge.mq5
+; Copie este arquivo para o MT5 e adapte para seu ambiente
+;
+; Como usar:
+; 1. Salve este arquivo como "VentryBridge.set" no MT5
+; 2. Ao anexar o EA ao gráfico, clique em "Load" e selecione este arquivo
+; 3. Ajuste os valores conforme necessário
+
+[VentryBridge]
+
+; === Configurações do Servidor ===
+InpBackendUrl=http://localhost:8000
+||InpBackendUrl1=string|http://localhost:8000
+
+InpAuthToken=CHANGE-ME-SET-A-STRONG-TOKEN
+||InpAuthToken1=string|CHANGE-ME-SET-A-STRONG-TOKEN
+
+; === Identificação do Terminal ===
+InpTerminalId=MT5-WS-01
+||InpTerminalId1=string|MT5-WS-01
+
+InpBroker=XP
+||InpBroker1=string|XP
+
+; === Símbolos para Monitorar ===
+; Liste os símbolos separados por vírgula, sem espaços
+; Exemplos: PETR4,VALE3,BBAS3,ITUB4,ABEV3
+InpSymbolsList=PETR4,VALE3,BBAS3
+||InpSymbolsList1=string|PETR4,VALE3,BBAS3
+
+; === Intervalos de Envio (em segundos) ===
+InpHeartbeatInterval=60
+||InpHeartbeatInterval1=int|60|10|300|1|N
+
+InpQuotesInterval=5
+||InpQuotesInterval1=int|5|1|60|1|N
+
+InpCommandsPollInterval=10
+||InpCommandsPollInterval1=int|10|5|120|1|N
+
+; === Configurações Avançadas ===
+InpEnableLogging=true
+||InpEnableLogging1=bool|true
+
+InpHttpTimeout=5000
+||InpHttpTimeout1=int|5000|1000|30000|100|N
