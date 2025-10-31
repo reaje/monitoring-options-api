@@ -8,7 +8,7 @@ from app.database.repositories.rules import RulesRepository
 from app.database.repositories.accounts import AccountsRepository
 from app.database.models import RollRuleCreate, RollRuleUpdate
 from app.core.logger import logger
-from app.core.exceptions import NotFoundError, ValidationError, AuthorizationError
+from app.core.exceptions import NotFoundError, ValidationError, AuthorizationError, DatabaseError
 from app.middleware.auth_middleware import require_auth
 
 
@@ -45,25 +45,50 @@ async def get_rules(request: Request):
     rules = []
 
     if account_id_param:
-        # Get rules for specific account
-        account_uuid = UUID(account_id_param)
+        # Parse/validate account UUID (avoid 500 on malformed input)
+        try:
+            account_uuid = UUID(account_id_param.strip())
+        except Exception:
+            raise ValidationError("Parâmetro 'account_id' inválido")
 
-        # Check ownership
-        if not await AccountsRepository.user_owns_account(account_uuid, user_id):
+        # Check ownership (return 403 on failure instead of bubbling to 500)
+        try:
+            owns = await AccountsRepository.user_owns_account(account_uuid, user_id)
+        except Exception as e:
+            logger.error("Ownership check failed", user_id=str(user_id), account_id=str(account_uuid), error=str(e))
             raise AuthorizationError("Not authorized to access this account")
 
-        rules = await RulesRepository.get_by_account_id(account_uuid)
+        if not owns:
+            raise AuthorizationError("Not authorized to access this account")
+
+        # Fetch rules for this account with guarded error handling
+        try:
+            rules = await RulesRepository.get_by_account_id(account_uuid, auth_user_id=user_id)
+        except Exception as e:
+            logger.error("Failed to fetch rules for account", user_id=str(user_id), account_id=str(account_uuid), error=str(e))
+            raise DatabaseError("Failed to fetch rules for this account")
 
     else:
-        # Get all accounts for user
-        accounts = await AccountsRepository.get_by_user_id(user_id)
+        # Get all accounts for user (guard errors)
+        try:
+            accounts = await AccountsRepository.get_by_user_id(user_id)
+        except Exception as e:
+            logger.error("Failed to list accounts for user", user_id=str(user_id), error=str(e))
+            return response.json({"rules": [], "total": 0}, status=200)
 
-        # Get rules for all user accounts
+        # Get rules for all user accounts (continue on per-account failure)
         for account in accounts:
-            account_rules = await RulesRepository.get_by_account_id(
-                UUID(account["id"])
-            )
-            rules.extend(account_rules)
+            try:
+                account_rules = await RulesRepository.get_by_account_id(
+                    UUID(account["id"]), auth_user_id=user_id
+                )
+                rules.extend(account_rules)
+            except Exception as e:
+                logger.error(
+                    "Failed to fetch rules for account while listing all",
+                    user_id=str(user_id), account_id=str(account.get("id")), error=str(e)
+                )
+                continue
 
     logger.info(
         "Retrieved user roll rules",
@@ -105,7 +130,7 @@ async def get_active_rules(request: Request):
         if not await AccountsRepository.user_owns_account(account_uuid, user_id):
             raise AuthorizationError("Not authorized to access this account")
 
-        rules = await RulesRepository.get_active_rules(account_uuid)
+        rules = await RulesRepository.get_active_rules(account_uuid, auth_user_id=user_id)
     else:
         # Get all accounts and their active rules
         accounts = await AccountsRepository.get_by_user_id(user_id)
@@ -113,7 +138,7 @@ async def get_active_rules(request: Request):
 
         for account in accounts:
             account_rules = await RulesRepository.get_active_rules(
-                UUID(account["id"])
+                UUID(account["id"]), auth_user_id=user_id
             )
             rules.extend(account_rules)
 
@@ -178,7 +203,7 @@ async def create_rule(request: Request):
             )
 
         # Create rule
-        rule = await RulesRepository.create(data.model_dump())
+        rule = await RulesRepository.create(data.model_dump(), auth_user_id=user_id)
 
         logger.info(
             "Roll rule created",
@@ -225,7 +250,7 @@ async def get_rule(request: Request, rule_id: str):
     """
     user = request.ctx.user
     user_id = UUID(user["id"])
-    rule_uuid = UUID(rule_id)
+    rule_uuid = rule_id if isinstance(rule_id, UUID) else UUID(str(rule_id))
 
     # Get rule with ownership check
     rule = await RulesRepository.get_user_rule(rule_uuid, user_id)
@@ -280,7 +305,7 @@ async def update_rule(request: Request, rule_id: str):
     try:
         user = request.ctx.user
         user_id = UUID(user["id"])
-        rule_uuid = UUID(rule_id)
+        rule_uuid = rule_id if isinstance(rule_id, UUID) else UUID(str(rule_id))
 
         # Check ownership
         existing = await RulesRepository.get_user_rule(rule_uuid, user_id)
@@ -297,7 +322,7 @@ async def update_rule(request: Request, rule_id: str):
             raise ValidationError("No fields to update")
 
         # Update rule
-        rule = await RulesRepository.update(rule_uuid, update_data)
+        rule = await RulesRepository.update(rule_uuid, update_data, auth_user_id=user_id)
 
         logger.info(
             "Rule updated",
@@ -343,7 +368,7 @@ async def delete_rule(request: Request, rule_id: str):
     """
     user = request.ctx.user
     user_id = UUID(user["id"])
-    rule_uuid = UUID(rule_id)
+    rule_uuid = rule_id if isinstance(rule_id, UUID) else UUID(str(rule_id))
 
     # Check ownership
     existing = await RulesRepository.get_user_rule(rule_uuid, user_id)
@@ -351,7 +376,7 @@ async def delete_rule(request: Request, rule_id: str):
         raise NotFoundError("Rule", rule_id)
 
     # Delete rule
-    await RulesRepository.delete(rule_uuid)
+    await RulesRepository.delete(rule_uuid, auth_user_id=user_id)
 
     logger.info(
         "Rule deleted",
@@ -388,7 +413,7 @@ async def toggle_rule(request: Request, rule_id: str):
     """
     user = request.ctx.user
     user_id = UUID(user["id"])
-    rule_uuid = UUID(rule_id)
+    rule_uuid = rule_id if isinstance(rule_id, UUID) else UUID(str(rule_id))
 
     # Check ownership
     existing = await RulesRepository.get_user_rule(rule_uuid, user_id)
@@ -396,7 +421,7 @@ async def toggle_rule(request: Request, rule_id: str):
         raise NotFoundError("Rule", rule_id)
 
     # Toggle active status
-    rule = await RulesRepository.toggle_active(rule_uuid)
+    rule = await RulesRepository.toggle_active(rule_uuid, auth_user_id=user_id)
 
     logger.info(
         "Rule toggled",

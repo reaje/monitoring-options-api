@@ -126,3 +126,15 @@ class RateLimitError(AppException):
             code="RATE_LIMIT_EXCEEDED",
             status_code=429,
         )
+
+
+class MarketDataUnavailableError(AppException):
+    """Raised when market data is temporarily unavailable (use 503)."""
+
+    def __init__(self, message: str = "Market data unavailable", details: Optional[Dict[str, Any]] = None):
+        super().__init__(
+            message=message,
+            code="MARKET_DATA_UNAVAILABLE",
+            status_code=503,
+            details=details,
+        )

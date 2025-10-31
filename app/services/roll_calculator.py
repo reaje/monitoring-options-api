@@ -18,7 +18,9 @@ class RollCalculator:
     async def get_roll_preview(
         self,
         position_id: UUID,
-        market_data: Optional[Dict[str, Any]] = None
+        market_data: Optional[Dict[str, Any]] = None,
+        *,
+        auth_user_id: Optional[UUID] = None
     ) -> Dict[str, Any]:
         """
         Generate roll preview with suggestions for a position.
@@ -31,14 +33,14 @@ class RollCalculator:
             Preview dict with current position and suggestions
         """
         # Get current position
-        position = await OptionsRepository.get_by_id(position_id)
+        position = await OptionsRepository.get_by_id(position_id, auth_user_id=auth_user_id)
 
         if not position:
             raise ValueError("Position not found")
 
         # Get account rules
         account_id = UUID(position["account_id"])
-        rules = await RulesRepository.get_active_rules(account_id)
+        rules = await RulesRepository.get_active_rules(account_id, auth_user_id=auth_user_id)
 
         # Use first rule or defaults
         rule = rules[0] if rules else self._get_default_rule()
@@ -120,7 +122,23 @@ class RollCalculator:
         # Generate suggestion grid
         # In production, this would fetch real options chain
         strike_increments = [0.03, 0.05, 0.08, 0.10, 0.12]
-        dte_options = [21, 30, 45, 60]
+        # Build DTE options dynamically from rule range
+        try:
+            _dte_min = int(dte_min)
+            _dte_max = int(dte_max)
+            if _dte_min > _dte_max:
+                _dte_min, _dte_max = _dte_max, _dte_min
+        except Exception:
+            _dte_min, _dte_max = 21, 45
+        span = max(0, _dte_max - _dte_min)
+        if span <= 0:
+            dte_options = [_dte_min]
+        else:
+            import math as _math
+            step = max(1, _math.ceil(span / 4))
+            dte_options = list(range(_dte_min, _dte_max + 1, step))
+            if _dte_max not in dte_options:
+                dte_options.append(_dte_max)
 
         for dte in dte_options:
             if dte < dte_min or dte > dte_max:
@@ -358,7 +376,8 @@ class RollCalculator:
         Returns:
             Mock market data
         """
-        strike = float(position.get("strike", 100))
+        _strike = position.get("strike", 100)
+        strike = float(_strike if _strike is not None else 100)
 
         # Mock current price near strike
         current_price = strike * 0.98  # Slightly below strike for CALL

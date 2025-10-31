@@ -57,6 +57,7 @@ async def heartbeat(request: Request):
     deny = _require_enabled_and_auth(request)
     if deny:
         return deny
+
     payload: Dict[str, Any] = request.json or {}
     upsert_heartbeat(payload)
     logger.info(
@@ -73,10 +74,26 @@ async def quotes(request: Request):
     deny = _require_enabled_and_auth(request)
     if deny:
         return deny
-    payload: Dict[str, Any] = request.json or {}
-    accepted = upsert_quotes(payload)
-    logger.info("mt5.quotes", count=accepted)
-    return response.json({"accepted": int(accepted)}, status=202)
+
+    # Parse JSON payload
+    try:
+        payload: Dict[str, Any] = request.json or {}
+    except Exception as e:
+        # JSON parse error
+        logger.error("mt5.quotes.json_parse_error", error=str(e), error_type=type(e).__name__)
+        return response.json({
+            "error": "invalid_json",
+            "details": str(e)
+        }, status=400)
+
+    # Process quotes
+    try:
+        accepted = upsert_quotes(payload)
+        logger.info("mt5.quotes", count=accepted)
+        return response.json({"accepted": int(accepted)}, status=202)
+    except Exception as e:
+        logger.error("mt5.quotes.processing_error", error=str(e))
+        return response.json({"error": "processing_error", "details": str(e)}, status=500)
 
 
 @mt5_bridge_bp.get("/commands")

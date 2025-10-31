@@ -50,7 +50,7 @@ async def get_assets(request: Request):
         if not await AccountsRepository.user_owns_account(account_uuid, user_id):
             raise AuthorizationError("Not authorized to access this account")
 
-        assets = await AssetsRepository.get_by_account_id(account_uuid)
+        assets = await AssetsRepository.get_by_account_id(account_uuid, auth_user_id=user_id)
     else:
         # Get all accounts for user
         accounts = await AccountsRepository.get_by_user_id(user_id)
@@ -59,7 +59,7 @@ async def get_assets(request: Request):
         assets = []
         for account in accounts:
             account_assets = await AssetsRepository.get_by_account_id(
-                UUID(account["id"])
+                UUID(account["id"]), auth_user_id=user_id
             )
             assets.extend(account_assets)
 
@@ -119,7 +119,8 @@ async def create_asset(request: Request):
         # Check if asset already exists for this account
         existing = await AssetsRepository.get_by_ticker(
             data.account_id,
-            data.ticker
+            data.ticker,
+            auth_user_id=user_id,
         )
         if existing:
             raise ValidationError(
@@ -127,7 +128,7 @@ async def create_asset(request: Request):
             )
 
         # Create asset
-        asset = await AssetsRepository.create(data.model_dump())
+        asset = await AssetsRepository.create(data.model_dump(), auth_user_id=user_id)
 
         logger.info(
             "Asset created",
@@ -247,7 +248,8 @@ async def update_asset(request: Request, asset_id: str):
             account_id = UUID(existing["account_id"])
             ticker_exists = await AssetsRepository.get_by_ticker(
                 account_id,
-                update_data["ticker"]
+                update_data["ticker"],
+                auth_user_id=user_id,
             )
             if ticker_exists and ticker_exists["id"] != str(asset_uuid):
                 raise ValidationError(
@@ -255,7 +257,7 @@ async def update_asset(request: Request, asset_id: str):
                 )
 
         # Update asset
-        asset = await AssetsRepository.update(asset_uuid, update_data)
+        asset = await AssetsRepository.update(asset_uuid, update_data, auth_user_id=user_id)
 
         logger.info(
             "Asset updated",
@@ -309,7 +311,7 @@ async def delete_asset(request: Request, asset_id: str):
         raise NotFoundError("Asset", asset_id)
 
     # Delete asset
-    await AssetsRepository.delete(asset_uuid)
+    await AssetsRepository.delete(asset_uuid, auth_user_id=user_id)
 
     logger.info(
         "Asset deleted",

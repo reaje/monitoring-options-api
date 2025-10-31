@@ -6,6 +6,7 @@ import asyncpg
 from app.config import settings
 from app.database.repositories.base import BaseRepository
 from app.core.logger import logger
+from app.database.supabase_client import supabase
 
 JWT_GUC = "request.jwt.claim.sub"
 
@@ -41,15 +42,34 @@ class AccountsRepository(BaseRepository):
                 JWT_GUC: str(auth_user_id),
                 "request.jwt.claim.role": "authenticated",
             })
-        conn = await asyncpg.connect(
-            host=settings.DB_HOST,
-            port=settings.DB_PORT,
-            user=settings.DB_USER,
-            password=settings.DB_PASSWORD,
-            database=settings.DB_NAME,
-            server_settings=server_settings,
-        )
+        # Use full DATABASE_URL to avoid DNS issues seen with separate host/port on some environments
+        conn = await asyncpg.connect(settings.DATABASE_URL, server_settings=server_settings)
         return conn
+
+    @classmethod
+    async def get_all(cls) -> List[Dict[str, Any]]:
+        """List all accounts (intended for background workers)."""
+        try:
+            conn = await cls._get_conn()
+            try:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT id, user_id, name, broker, account_number, created_at
+                    FROM {settings.DB_SCHEMA}.accounts
+                    ORDER BY created_at DESC
+                    """
+                )
+                return [_serialize_account_row(r) for r in rows]
+            finally:
+                await conn.close()
+        except Exception as e:
+            # Fallback to Supabase service client if direct PG connection fails (e.g., DNS)
+            logger.warning("AccountsRepository.get_all fallback to Supabase", error=str(e))
+            result = supabase.table(cls.table_name) \
+                .select("id,user_id,name,broker,account_number,created_at") \
+                .order("created_at") \
+                .execute()
+            return result.data or []
 
     @classmethod
     async def get_by_user_id(cls, user_id: UUID) -> List[Dict[str, Any]]:
@@ -215,7 +235,7 @@ class AccountsRepository(BaseRepository):
         Returns:
             True if user owns account
         """
-        account = await cls.get_by_id(account_id)
+        account = await cls.get_by_id(account_id, auth_user_id=user_id)
 
         if not account:
             return False

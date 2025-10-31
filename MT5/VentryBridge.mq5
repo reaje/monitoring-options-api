@@ -10,8 +10,8 @@
 #property strict
 
 // Incluir bibliotecas auxiliares
-#include "Include/HttpClient.mqh"
-#include "Include/JsonHelper.mqh"
+#include <HttpClient.mqh>
+#include <JsonHelper.mqh>
 
 //--- Inputs configuráveis
 input group "=== Configurações do Servidor ==="
@@ -311,12 +311,8 @@ void SendQuotes()
             continue;
         }
 
-        // Obter volume (se disponível)
-        long volume = 0;
-        if(SymbolInfoInteger(symbol, SYMBOL_VOLUME_REAL))
-            volume = tick.volume_real;
-        else
-            volume = tick.volume;
+        // Obter volume do tick
+        long volume = (long)tick.volume;
 
         // Adicionar vírgula se não for o primeiro
         if(quotes_added > 0)

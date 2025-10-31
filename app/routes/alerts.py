@@ -58,7 +58,8 @@ async def get_alerts(request: Request):
 
         alerts = await AlertQueueRepository.get_by_account_id(
             account_uuid,
-            status=status_param
+            status=status_param,
+            auth_user_id=user_id,
         )
 
     else:
@@ -69,7 +70,8 @@ async def get_alerts(request: Request):
         for account in accounts:
             account_alerts = await AlertQueueRepository.get_by_account_id(
                 UUID(account["id"]),
-                status=status_param
+                status=status_param,
+                auth_user_id=user_id,
             )
             alerts.extend(account_alerts)
 
@@ -123,7 +125,8 @@ async def get_pending_alerts(request: Request):
 
         alerts = await AlertQueueRepository.get_by_account_id(
             account_uuid,
-            status="PENDING"
+            status="PENDING",
+            auth_user_id=user_id,
         )
     else:
         # Get all accounts and their pending alerts
@@ -133,7 +136,8 @@ async def get_pending_alerts(request: Request):
         for account in accounts:
             account_alerts = await AlertQueueRepository.get_by_account_id(
                 UUID(account["id"]),
-                status="PENDING"
+                status="PENDING",
+                auth_user_id=user_id,
             )
             alerts.extend(account_alerts)
 
@@ -191,8 +195,8 @@ async def create_alert(request: Request):
                 "Not authorized to create alerts in this account"
             )
 
-        # Create alert
-        alert = await AlertQueueRepository.create(data.model_dump())
+        # Create alert (pass auth_user_id to satisfy RLS)
+        alert = await AlertQueueRepository.create(data.model_dump(), auth_user_id=user_id)
 
         logger.info(
             "Alert created",
@@ -289,8 +293,8 @@ async def delete_alert(request: Request, alert_id: str):
     if not existing:
         raise NotFoundError("Alert", alert_id)
 
-    # Delete alert
-    await AlertQueueRepository.delete(alert_uuid)
+    # Delete alert (pass auth_user_id to satisfy RLS)
+    await AlertQueueRepository.delete(alert_uuid, auth_user_id=user_id)
 
     logger.info(
         "Alert deleted",
@@ -334,8 +338,8 @@ async def retry_alert(request: Request, alert_id: str):
     if not existing:
         raise NotFoundError("Alert", alert_id)
 
-    # Retry alert
-    alert = await AlertQueueRepository.retry_failed_alert(alert_uuid)
+    # Retry alert (pass auth_user_id to satisfy RLS)
+    alert = await AlertQueueRepository.retry_failed_alert(alert_uuid, auth_user_id=user_id)
 
     logger.info(
         "Alert marked for retry",
@@ -387,7 +391,7 @@ async def get_alert_statistics(request: Request, account_id: str):
     hours = int(request.args.get("hours", 24))
 
     # Get statistics
-    stats = await AlertQueueRepository.get_statistics(account_uuid, hours)
+    stats = await AlertQueueRepository.get_statistics(account_uuid, hours, auth_user_id=user_id)
 
     return response.json(
         {"statistics": stats},
@@ -426,7 +430,7 @@ async def get_alert_logs(request: Request, alert_id: str):
         raise NotFoundError("Alert", alert_id)
 
     # Get logs
-    logs = await AlertLogsRepository.get_by_queue_id(alert_uuid)
+    logs = await AlertLogsRepository.get_by_queue_id(alert_uuid, auth_user_id=user_id)
 
     return response.json(
         {
@@ -461,7 +465,7 @@ async def get_logs_statistics(request: Request):
     hours = int(request.args.get("hours", 24))
 
     # Get statistics
-    stats = await AlertLogsRepository.get_statistics(hours)
+    stats = await AlertLogsRepository.get_statistics(hours, auth_user_id=UUID(request.ctx.user["id"]))
 
     return response.json(
         {"statistics": stats},

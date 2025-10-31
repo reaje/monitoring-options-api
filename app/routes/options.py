@@ -61,7 +61,8 @@ async def get_options(request: Request):
 
         positions = await OptionsRepository.get_by_account_id(
             account_uuid,
-            status=status_param
+            status=status_param,
+            auth_user_id=user_id,
         )
 
     elif asset_id_param:
@@ -74,7 +75,8 @@ async def get_options(request: Request):
 
         positions = await OptionsRepository.get_by_asset_id(
             asset_uuid,
-            status=status_param
+            status=status_param,
+            auth_user_id=user_id,
         )
 
     else:
@@ -85,7 +87,8 @@ async def get_options(request: Request):
         for account in accounts:
             account_positions = await OptionsRepository.get_by_account_id(
                 UUID(account["id"]),
-                status=status_param
+                status=status_param,
+                auth_user_id=user_id,
             )
             positions.extend(account_positions)
 
@@ -137,7 +140,7 @@ async def get_active_options(request: Request):
         if not await AccountsRepository.user_owns_account(account_uuid, user_id):
             raise AuthorizationError("Not authorized to access this account")
 
-        positions = await OptionsRepository.get_open_positions(account_uuid)
+        positions = await OptionsRepository.get_open_positions(account_uuid, auth_user_id=user_id)
     else:
         # Get all accounts and their open positions
         accounts = await AccountsRepository.get_by_user_id(user_id)
@@ -145,7 +148,8 @@ async def get_active_options(request: Request):
 
         for account in accounts:
             account_positions = await OptionsRepository.get_open_positions(
-                UUID(account["id"])
+                UUID(account["id"]),
+                auth_user_id=user_id,
             )
             positions.extend(account_positions)
 
@@ -210,7 +214,7 @@ async def create_option(request: Request):
             raise AuthorizationError("Not authorized to use this asset")
 
         # Create position
-        position = await OptionsRepository.create(data.model_dump())
+        position = await OptionsRepository.create(data.model_dump(), auth_user_id=user_id)
 
         logger.info(
             "Option position created",
@@ -258,7 +262,7 @@ async def get_option(request: Request, position_id: str):
     """
     user = request.ctx.user
     user_id = UUID(user["id"])
-    position_uuid = UUID(position_id)
+    position_uuid = position_id if isinstance(position_id, UUID) else UUID(str(position_id))
 
     # Get position with ownership check
     position = await OptionsRepository.get_user_position(position_uuid, user_id)
@@ -314,7 +318,7 @@ async def update_option(request: Request, position_id: str):
     try:
         user = request.ctx.user
         user_id = UUID(user["id"])
-        position_uuid = UUID(position_id)
+        position_uuid = position_id if isinstance(position_id, UUID) else UUID(str(position_id))
 
         # Check ownership
         existing = await OptionsRepository.get_user_position(position_uuid, user_id)
@@ -331,7 +335,7 @@ async def update_option(request: Request, position_id: str):
             raise ValidationError("No fields to update")
 
         # Update position
-        position = await OptionsRepository.update(position_uuid, update_data)
+        position = await OptionsRepository.update(position_uuid, update_data, auth_user_id=user_id)
 
         logger.info(
             "Position updated",
@@ -377,7 +381,7 @@ async def delete_option(request: Request, position_id: str):
     """
     user = request.ctx.user
     user_id = UUID(user["id"])
-    position_uuid = UUID(position_id)
+    position_uuid = position_id if isinstance(position_id, UUID) else UUID(str(position_id))
 
     # Check ownership
     existing = await OptionsRepository.get_user_position(position_uuid, user_id)
@@ -385,7 +389,7 @@ async def delete_option(request: Request, position_id: str):
         raise NotFoundError("Position", position_id)
 
     # Delete position
-    await OptionsRepository.delete(position_uuid)
+    await OptionsRepository.delete(position_uuid, auth_user_id=user_id)
 
     logger.info(
         "Position deleted",
@@ -422,7 +426,7 @@ async def close_option(request: Request, position_id: str):
     """
     user = request.ctx.user
     user_id = UUID(user["id"])
-    position_uuid = UUID(position_id)
+    position_uuid = position_id if isinstance(position_id, UUID) else UUID(str(position_id))
 
     # Check ownership
     existing = await OptionsRepository.get_user_position(position_uuid, user_id)
@@ -430,7 +434,7 @@ async def close_option(request: Request, position_id: str):
         raise NotFoundError("Position", position_id)
 
     # Close position
-    position = await OptionsRepository.close_position(position_uuid)
+    position = await OptionsRepository.close_position(position_uuid, auth_user_id=user_id)
 
     logger.info(
         "Position closed",
@@ -475,7 +479,7 @@ async def get_statistics(request: Request, account_id: str):
         raise AuthorizationError("Not authorized to access this account")
 
     # Get statistics
-    stats = await OptionsRepository.get_statistics(account_uuid)
+    stats = await OptionsRepository.get_statistics(account_uuid, auth_user_id=user_id)
 
     return response.json(
         {"statistics": stats},

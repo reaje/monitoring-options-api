@@ -11,6 +11,8 @@ from app.routes.auth import auth_bp
 from app.routes.accounts import accounts_bp
 from app.routes.assets import assets_bp
 from app.routes.options import options_bp
+from app.routes.equity import equity_bp
+
 from app.routes.rules import rules_bp
 from app.routes.alerts import alerts_bp
 from app.routes.notifications import notifications_bp
@@ -19,6 +21,14 @@ from app.routes.rolls import rolls_bp
 from app.routes.market_data import market_data_bp
 from app.workers.scheduler import worker_scheduler
 from datetime import datetime
+
+# MT5 bridge blueprint (optional)
+try:
+    from MT5.bridge_blueprint import mt5_bridge_bp
+    logger.info("MT5 bridge blueprint imported successfully")
+except Exception as e:
+    logger.warning(f"MT5 bridge blueprint not available: {e}")
+    mt5_bridge_bp = None
 
 
 # Create Sanic app
@@ -78,12 +88,21 @@ app.blueprint(auth_bp)
 app.blueprint(accounts_bp)
 app.blueprint(assets_bp)
 app.blueprint(options_bp)
+app.blueprint(equity_bp)
+
 app.blueprint(rules_bp)
 app.blueprint(alerts_bp)
 app.blueprint(notifications_bp)
 app.blueprint(workers_bp)
 app.blueprint(rolls_bp)
 app.blueprint(market_data_bp)
+
+# Optionally register MT5 bridge endpoints
+if mt5_bridge_bp is not None:
+    app.blueprint(mt5_bridge_bp)
+    logger.info("MT5 bridge blueprint registered successfully")
+else:
+    logger.warning("MT5 bridge blueprint not registered (import failed)")
 
 
 # =====================================

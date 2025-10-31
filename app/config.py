@@ -98,6 +98,16 @@ class Settings(BaseSettings):
     MARKET_DATA_PROVIDER: str = "mock"
     MARKET_DATA_API_KEY: str = ""
     MARKET_DATA_REFRESH_INTERVAL: int = 60
+    MARKET_DATA_HYBRID_FALLBACK: str = "brapi"  # usado quando provider=hybrid
+
+    # =====================================
+    # MT5 BRIDGE CONFIGURATION
+    # =====================================
+    MT5_BRIDGE_ENABLED: bool = False
+    MT5_BRIDGE_TOKEN: str = ""
+    MT5_BRIDGE_ALLOWED_IPS: str = ""  # CSV
+    MT5_BRIDGE_QUOTE_TTL_SECONDS: int = 10
+    MT5_BRIDGE_COMMAND_TTL_SECONDS: int = 60
 
     model_config = SettingsConfigDict(
         env_file=".env",

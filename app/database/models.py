@@ -260,6 +260,7 @@ class RollRuleBase(BaseModel):
     min_oi: Optional[int] = Field(5000, ge=0)
     target_otm_pct_low: Optional[float] = Field(0.03, ge=0)
     target_otm_pct_high: Optional[float] = Field(0.08, ge=0)
+    premium_close_threshold: Optional[float] = Field(None, ge=0)
     notify_channels: Optional[List[str]] = Field(default_factory=lambda: ["whatsapp", "sms"])
     is_active: Optional[bool] = Field(True)
 
@@ -283,6 +284,7 @@ class RollRuleUpdate(BaseModel):
     min_oi: Optional[int] = Field(None, ge=0)
     target_otm_pct_low: Optional[float] = Field(None, ge=0)
     target_otm_pct_high: Optional[float] = Field(None, ge=0)
+    premium_close_threshold: Optional[float] = Field(None, ge=0)
     notify_channels: Optional[List[str]] = None
     is_active: Optional[bool] = None
 

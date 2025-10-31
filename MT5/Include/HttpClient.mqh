@@ -45,8 +45,12 @@ public:
         char result_data[];
         string result_headers;
 
-        // Converter string para array de bytes
+        // Converter string para array de bytes (sem null terminator)
         int data_len = StringToCharArray(json_data, post_data, 0, WHOLE_ARRAY, CP_UTF8) - 1;
+
+        // Redimensionar array para remover o null terminator
+        if(data_len > 0)
+            ArrayResize(post_data, data_len);
 
         ResetLastError();
         int res = WebRequest(

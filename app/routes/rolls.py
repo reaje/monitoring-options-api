@@ -63,7 +63,8 @@ async def get_roll_preview(request: Request):
         # Generate roll preview
         preview = await roll_calculator.get_roll_preview(
             position_id,
-            market_data
+            market_data,
+            auth_user_id=user_id
         )
 
         logger.info(
@@ -93,7 +94,7 @@ async def get_roll_preview(request: Request):
 @openapi.response(403, description="Not authorized")
 @openapi.response(404, description="Position not found")
 @require_auth
-async def get_roll_suggestions(request: Request, position_id: str):
+async def get_roll_suggestions(request: Request, position_id: UUID):
     """
     Get roll suggestions for a position (simplified endpoint).
 
@@ -106,7 +107,7 @@ async def get_roll_suggestions(request: Request, position_id: str):
     try:
         user = request.ctx.user
         user_id = UUID(user["id"])
-        position_uuid = UUID(position_id)
+        position_uuid = position_id if isinstance(position_id, UUID) else UUID(str(position_id))
 
         # Check ownership
         position = await OptionsRepository.get_user_position(position_uuid, user_id)
@@ -114,12 +115,12 @@ async def get_roll_suggestions(request: Request, position_id: str):
             raise NotFoundError("Position", position_id)
 
         # Generate preview
-        preview = await roll_calculator.get_roll_preview(position_uuid)
+        preview = await roll_calculator.get_roll_preview(position_uuid, auth_user_id=user_id)
 
         # Return only suggestions
         return response.json(
             {
-                "position_id": position_id,
+                "position_id": str(position_uuid),
                 "suggestions": preview["suggestions"],
                 "current_metrics": {
                     "dte": preview["current_position"].get("dte"),
@@ -147,7 +148,7 @@ async def get_roll_suggestions(request: Request, position_id: str):
 @openapi.response(401, description="Not authenticated")
 @openapi.response(403, description="Not authorized to access this account")
 @require_auth
-async def get_account_roll_analysis(request: Request, account_id: str):
+async def get_account_roll_analysis(request: Request, account_id: UUID):
     """
     Get roll analysis for all open positions in an account.
 
@@ -159,14 +160,14 @@ async def get_account_roll_analysis(request: Request, account_id: str):
     try:
         user = request.ctx.user
         user_id = UUID(user["id"])
-        account_uuid = UUID(account_id)
+        account_uuid = account_id if isinstance(account_id, UUID) else UUID(str(account_id))
 
         # Check ownership
         if not await AccountsRepository.user_owns_account(account_uuid, user_id):
             raise AuthorizationError("Not authorized to access this account")
 
         # Get all open positions
-        open_positions = await OptionsRepository.get_open_positions(account_uuid)
+        open_positions = await OptionsRepository.get_open_positions(account_uuid, auth_user_id=user_id)
 
         analysis = []
 
@@ -174,7 +175,8 @@ async def get_account_roll_analysis(request: Request, account_id: str):
             try:
                 # Generate preview for each position
                 preview = await roll_calculator.get_roll_preview(
-                    UUID(position["id"])
+                    UUID(position["id"]),
+                    auth_user_id=user_id
                 )
 
                 # Get best suggestion
@@ -212,7 +214,7 @@ async def get_account_roll_analysis(request: Request, account_id: str):
 
         return response.json(
             {
-                "account_id": account_id,
+                "account_id": str(account_uuid),
                 "positions": analysis,
                 "total_positions": len(analysis)
             },

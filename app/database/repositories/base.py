@@ -19,6 +19,18 @@ class BaseRepository:
             raise ValueError(f"table_name must be defined in {cls.__name__}")
 
     @classmethod
+    def _get_table(cls):
+        """Get table with correct schema."""
+        cls._ensure_table_name()
+        # Get the table and manually set the schema
+        table = supabase.table(cls.table_name)
+        schema_name = getattr(supabase, 'schema_name', 'monitoring_options_operations')
+        # Override the schema in the URL path
+        table.session.headers['Accept-Profile'] = schema_name
+        table.session.headers['Content-Profile'] = schema_name
+        return table
+
+    @classmethod
     async def get_all(
         cls,
         filters: Optional[Dict[str, Any]] = None,
@@ -40,10 +52,8 @@ class BaseRepository:
         Returns:
             List of records
         """
-        cls._ensure_table_name()
-
         try:
-            query = supabase.table(cls.table_name).select("*")
+            query = cls._get_table().select("*")
 
             # Apply filters
             if filters:
@@ -87,10 +97,8 @@ class BaseRepository:
         Returns:
             Record dict or None if not found
         """
-        cls._ensure_table_name()
-
         try:
-            result = supabase.table(cls.table_name) \
+            result = cls._get_table() \
                 .select("*") \
                 .eq("id", str(id)) \
                 .single() \
@@ -128,10 +136,8 @@ class BaseRepository:
         Returns:
             Created record
         """
-        cls._ensure_table_name()
-
         try:
-            result = supabase.table(cls.table_name) \
+            result = cls._get_table() \
                 .insert(data) \
                 .execute()
 
@@ -169,8 +175,6 @@ class BaseRepository:
         Raises:
             NotFoundError: If record not found
         """
-        cls._ensure_table_name()
-
         try:
             # Check if record exists
             existing = await cls.get_by_id(id)
@@ -178,7 +182,7 @@ class BaseRepository:
                 raise NotFoundError(cls.table_name, id)
 
             # Update record
-            result = supabase.table(cls.table_name) \
+            result = cls._get_table() \
                 .update(data) \
                 .eq("id", str(id)) \
                 .execute()
@@ -219,8 +223,6 @@ class BaseRepository:
         Raises:
             NotFoundError: If record not found
         """
-        cls._ensure_table_name()
-
         try:
             # Check if record exists
             existing = await cls.get_by_id(id)
@@ -228,7 +230,7 @@ class BaseRepository:
                 raise NotFoundError(cls.table_name, id)
 
             # Delete record
-            supabase.table(cls.table_name) \
+            cls._get_table() \
                 .delete() \
                 .eq("id", str(id)) \
                 .execute()
@@ -261,10 +263,8 @@ class BaseRepository:
         Returns:
             Number of records
         """
-        cls._ensure_table_name()
-
         try:
-            query = supabase.table(cls.table_name).select("id", count="exact")
+            query = cls._get_table().select("id", count="exact")
 
             # Apply filters
             if filters:

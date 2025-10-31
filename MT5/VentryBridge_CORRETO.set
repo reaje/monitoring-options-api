@@ -1,0 +1,48 @@
+; Arquivo de configuração CORRETO para VentryBridge.mq5
+; Gerado em: 30/10/2025
+;
+; Como usar:
+; 1. Abra o MT5
+; 2. Remova o EA atual do gráfico
+; 3. Anexe o VentryBridge.mq5 novamente
+; 4. Na aba "Inputs", clique em "Load" e selecione este arquivo
+; 5. Clique OK para aplicar
+
+[VentryBridge]
+
+; === Configurações do Servidor ===
+InpBackendUrl=http://localhost:8000
+||InpBackendUrl1=string|http://localhost:8000
+
+; TOKEN CORRETO - deve corresponder ao MT5_BRIDGE_TOKEN do .env
+InpAuthToken=oGHv0gBOC5tG47g4qYFlt99r0yxccz-kFHV5UW92Ka4
+||InpAuthToken1=string|oGHv0gBOC5tG47g4qYFlt99r0yxccz-kFHV5UW92Ka4
+
+; === Identificação do Terminal ===
+InpTerminalId=MT5-WS-01
+||InpTerminalId1=string|MT5-WS-01
+
+InpBroker=XP
+||InpBroker1=string|XP
+
+; === Símbolos para Monitorar ===
+; Liste os símbolos separados por vírgula, sem espaços
+InpSymbolsList=VALE3,PETR4,BBAS3
+||InpSymbolsList1=string|VALE3,PETR4,BBAS3
+
+; === Intervalos de Envio (em segundos) ===
+InpHeartbeatInterval=60
+||InpHeartbeatInterval1=int|60|10|300|1|N
+
+InpQuotesInterval=5
+||InpQuotesInterval1=int|5|1|60|1|N
+
+InpCommandsPollInterval=10
+||InpCommandsPollInterval1=int|10|5|120|1|N
+
+; === Configurações Avançadas ===
+InpEnableLogging=true
+||InpEnableLogging1=bool|true
+
+InpHttpTimeout=5000
+||InpHttpTimeout1=int|5000|1000|30000|100|N

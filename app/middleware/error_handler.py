@@ -5,6 +5,8 @@ from sanic.exceptions import SanicException
 from pydantic import ValidationError
 from app.core.exceptions import AppException
 from app.core.logger import logger
+from app.config import settings
+
 from datetime import datetime
 
 
@@ -26,13 +28,22 @@ def setup_error_handlers(app: Sanic) -> None:
             path=request.path,
         )
 
-        return response.json(
-            {
-                **exception.to_dict(),
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-            },
-            status=exception.status_code,
-        )
+        payload = {
+            **exception.to_dict(),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+        # Always include minimal diagnostics to help QA/E2E without leaking secrets
+        payload.setdefault("error", {}).setdefault("details", {})
+        payload["error"]["details"].update({
+            "exception": exception.__class__.__name__,
+            "message": str(exception),
+        })
+        if settings.DEBUG:
+            payload["debug"] = {
+                "exception": exception.__class__.__name__,
+                "message": str(exception),
+            }
+        return response.json(payload, status=exception.status_code)
 
     @app.exception(ValidationError)
     async def handle_validation_error(request, exception: ValidationError):
@@ -43,17 +54,26 @@ def setup_error_handlers(app: Sanic) -> None:
             path=request.path,
         )
 
-        return response.json(
-            {
-                "error": {
-                    "code": "VALIDATION_ERROR",
-                    "message": "Dados inválidos",
-                    "details": exception.errors(),
-                },
-                "timestamp": datetime.utcnow().isoformat() + "Z",
+        payload = {
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "Dados inválidos",
+                "details": exception.errors(),
             },
-            status=422,
-        )
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+        # Also include summarized diagnostics to help QA
+        payload["error"].setdefault("details", {})
+        payload["error"]["details"].update({
+            "exception": exception.__class__.__name__,
+            "message": str(exception),
+        })
+        if settings.DEBUG:
+            payload["debug"] = {
+                "exception": exception.__class__.__name__,
+                "message": str(exception),
+            }
+        return response.json(payload, status=422)
 
     @app.exception(SanicException)
     async def handle_sanic_exception(request, exception: SanicException):
@@ -65,16 +85,23 @@ def setup_error_handlers(app: Sanic) -> None:
             path=request.path,
         )
 
-        return response.json(
-            {
-                "error": {
-                    "code": exception.__class__.__name__,
+        payload = {
+            "error": {
+                "code": exception.__class__.__name__,
+                "message": str(exception),
+                "details": {
+                    "exception": exception.__class__.__name__,
                     "message": str(exception),
                 },
-                "timestamp": datetime.utcnow().isoformat() + "Z",
             },
-            status=exception.status_code,
-        )
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+        if settings.DEBUG:
+            payload["debug"] = {
+                "exception": exception.__class__.__name__,
+                "message": str(exception),
+            }
+        return response.json(payload, status=exception.status_code)
 
     @app.exception(Exception)
     async def handle_generic_exception(request, exception: Exception):
@@ -87,13 +114,20 @@ def setup_error_handlers(app: Sanic) -> None:
             exc_info=True,
         )
 
-        return response.json(
-            {
-                "error": {
-                    "code": "INTERNAL_ERROR",
-                    "message": "Erro interno do servidor",
+        payload = {
+            "error": {
+                "code": "INTERNAL_ERROR",
+                "message": "Erro interno do servidor",
+                "details": {
+                    "exception": exception.__class__.__name__,
+                    "message": str(exception),
                 },
-                "timestamp": datetime.utcnow().isoformat() + "Z",
             },
-            status=500,
-        )
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+        if settings.DEBUG:
+            payload["debug"] = {
+                "exception": exception.__class__.__name__,
+                "message": str(exception),
+            }
+        return response.json(payload, status=500)

@@ -3,10 +3,13 @@
 from typing import List, Dict, Any
 from uuid import UUID
 from datetime import datetime, date
+import asyncio
 from app.database.repositories.options import OptionsRepository
 from app.database.repositories.rules import RulesRepository
 from app.database.repositories.alerts import AlertQueueRepository
 from app.database.repositories.accounts import AccountsRepository
+from app.database.repositories.assets import AssetsRepository
+from app.services.market_data import market_data_provider
 from app.core.logger import logger
 
 
@@ -42,6 +45,8 @@ class MonitorWorker:
 
             for account in accounts:
                 account_id = UUID(account["id"])
+                user_id = UUID(account.get("user_id")) if account.get("user_id") else None
+
 
                 # Get active rules for account
                 active_rules = await RulesRepository.get_active_rules(account_id)
@@ -70,7 +75,8 @@ class MonitorWorker:
                     # Check expiration warning
                     expiration_alert = await self._check_expiration_warning(
                         position,
-                        account_id
+                        account_id,
+                        user_id
                     )
                     if expiration_alert:
                         total_alerts_created += 1
@@ -80,7 +86,8 @@ class MonitorWorker:
                         triggered = await self._check_position_against_rule(
                             position,
                             rule,
-                            account_id
+                            account_id,
+                            user_id
                         )
                         if triggered:
                             total_alerts_created += 1
@@ -122,17 +129,27 @@ class MonitorWorker:
         Returns:
             List of account dicts
         """
-        # This is a simplified version - in production you might want to
-        # query only accounts with open positions
-        from app.database.supabase_client import supabase
-
-        result = supabase.table("accounts").select("*").execute()
-        return result.data
+        # Use direct DB repository to avoid SDK/version mismatches in workers
+        for attempt in range(3):
+            try:
+                accounts = await AccountsRepository.get_all()
+                return accounts
+            except Exception as e:
+                logger.error(
+                    "Failed to fetch accounts via repository",
+                    attempt=attempt + 1,
+                    error=str(e)
+                )
+                if attempt < 2:
+                    await asyncio.sleep(1.0 * (attempt + 1))
+                else:
+                    return []
 
     async def _check_expiration_warning(
         self,
         position: Dict[str, Any],
-        account_id: UUID
+        account_id: UUID,
+        user_id: UUID
     ) -> bool:
         """
         Check if position is close to expiration and create alert.
@@ -159,7 +176,8 @@ class MonitorWorker:
             # Check if we already created an alert for this position today
             existing_alerts = await AlertQueueRepository.get_by_account_id(
                 account_id,
-                status=None  # Get all statuses
+                status=None,  # Get all statuses
+                auth_user_id=user_id
             )
 
             # Check if there's already an expiration warning for this position today
@@ -185,7 +203,7 @@ class MonitorWorker:
                 "status": "PENDING"
             }
 
-            await AlertQueueRepository.create(alert_data)
+            await AlertQueueRepository.create(alert_data, auth_user_id=user_id)
 
             logger.info(
                 "Created expiration warning alert",
@@ -201,7 +219,8 @@ class MonitorWorker:
         self,
         position: Dict[str, Any],
         rule: Dict[str, Any],
-        account_id: UUID
+        account_id: UUID,
+        user_id: UUID
     ) -> bool:
         """
         Check if position triggers a rule and create alert.
@@ -214,16 +233,56 @@ class MonitorWorker:
         Returns:
             True if alert was created
         """
-        # Use the RulesRepository evaluation method
-        # In a real implementation, we'd fetch current delta and price from market data
-        current_delta = None  # TODO: Fetch from market data service
-        current_price = None  # TODO: Fetch from market data service
+        # Fetch required market data
+        current_delta = None  # Could be added from provider greeks in the future
+        current_price = None
+        current_premium = None
+
+        # Derive underlying ticker from asset_id
+        asset_id = position.get("asset_id")
+        ticker = position.get("ticker")  # fallback if present
+        try:
+            if asset_id and not ticker:
+                from uuid import UUID as _UUID
+                asset = await AssetsRepository.get_by_id(_UUID(str(asset_id)))
+                if asset:
+                    ticker = asset.get("ticker")
+        except Exception:
+            pass
+
+        try:
+            if ticker:
+                quote = await market_data_provider.get_quote(ticker)
+                current_price = quote.get("current_price") if isinstance(quote, dict) else None
+        except Exception as e:
+            logger.warning("Failed to fetch underlying quote", ticker=ticker, error=str(e))
+
+        try:
+            if ticker and position.get("strike") and position.get("expiration") and position.get("side"):
+                opt = await market_data_provider.get_option_quote(
+                    ticker=str(ticker),
+                    strike=float(position["strike"]),
+                    expiration=str(position["expiration"]),
+                    option_type=str(position["side"]).upper(),
+                )
+                # Prefer mid of bid/ask, fallback to premium/last
+                bid = opt.get("bid") if isinstance(opt, dict) else None
+                ask = opt.get("ask") if isinstance(opt, dict) else None
+                if bid is not None and ask is not None and ask >= bid:
+                    current_premium = round((float(bid) + float(ask)) / 2.0, 4)
+                else:
+                    current_premium = opt.get("premium") or opt.get("last")
+                    if current_premium is not None:
+                        current_premium = float(current_premium)
+        except Exception as e:
+            logger.warning("Failed to fetch option quote", ticker=ticker, error=str(e))
 
         is_triggered = await RulesRepository.evaluate_rule_for_position(
             rule,
             position,
             current_delta,
-            current_price
+            current_price,
+            current_premium,
         )
 
         if is_triggered:
@@ -231,11 +290,25 @@ class MonitorWorker:
             today = date.today().isoformat()
             existing_alerts = await AlertQueueRepository.get_by_account_id(
                 account_id,
-                status=None
+                status=None,
+                auth_user_id=user_id
             )
 
             for alert in existing_alerts:
+                # Ensure alert is a dict (may be raw JSON string)
+                if not isinstance(alert, dict):
+                    try:
+                        import json as _json
+                        alert = _json.loads(alert)
+                    except Exception:
+                        continue
                 payload = alert.get("payload", {})
+                if isinstance(payload, str):
+                    try:
+                        import json as _json
+                        payload = _json.loads(payload)
+                    except Exception:
+                        payload = {}
                 if (alert.get("option_position_id") == position["id"] and
                     alert.get("reason") == "roll_trigger" and
                     payload.get("rule_id") == rule["id"] and
@@ -249,23 +322,26 @@ class MonitorWorker:
                 "reason": "roll_trigger",
                 "payload": {
                     "rule_id": rule["id"],
-                    "ticker": position.get("ticker", "N/A"),
+                    "ticker": ticker or position.get("ticker", "N/A"),
                     "strike": float(position.get("strike", 0)),
                     "expiration": str(position.get("expiration")),
                     "side": position.get("side"),
                     "delta": current_delta,
                     "price": current_price,
+                    "premium": current_premium,
                     "dte": self._calculate_dte(position.get("expiration"))
                 },
                 "status": "PENDING"
             }
 
-            await AlertQueueRepository.create(alert_data)
+            await AlertQueueRepository.create(alert_data, auth_user_id=user_id)
 
             logger.info(
                 "Created roll trigger alert",
                 position_id=position["id"],
-                rule_id=rule["id"]
+                rule_id=rule["id"],
+                premium=current_premium,
+                price=current_price,
             )
 
             return True

@@ -32,10 +32,12 @@ class SupabaseClient:
                 logger.info("Supabase client initialized successfully")
                 # Set default schema for PostgREST so .table() uses our schema
                 try:
-                    cls._instance.postgrest = cls._instance.postgrest.schema(settings.DB_SCHEMA)
-                    logger.info("Supabase PostgREST default schema set", schema=settings.DB_SCHEMA)
+                    # Store the schema in the client for later use
+                    cls._instance.schema_name = settings.DB_SCHEMA
+                    logger.info("Supabase schema configured", schema=settings.DB_SCHEMA)
                 except Exception as e:
-                    logger.warning("Could not set Supabase default schema; using 'public'", error=str(e))
+                    logger.warning("Could not configure Supabase schema; using 'public'", error=str(e))
+                    cls._instance.schema_name = "public"
 
             except Exception as e:
                 logger.error("Failed to initialize Supabase client", error=str(e))

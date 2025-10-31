@@ -1,0 +1,11 @@
+; VentryBridge Expert Advisor - Configuracao de Producao
+; Gerado automaticamente em 2025-10-28
+; Para usar: Clique com botao direito no EA -> Load Settings -> Selecione este arquivo
+
+InpBackendUrl=http://127.0.0.1:8000
+InpAuthToken=oGHv0gBOC5tG47g4qYFlt99r0yxccz-kFHV5UW92Ka4
+InpHttpTimeout=5000
+InpSymbolsToSend=WIN$N,WINJ25,VALE3,PETR4,BBAS3
+InpHeartbeatInterval=60
+InpQuotesInterval=5
+InpCommandsPollInterval=10

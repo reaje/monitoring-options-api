@@ -5,7 +5,7 @@ from sanic.request import Request
 from sanic_ext import openapi
 from app.services.market_data import market_data_provider
 from app.core.logger import logger
-from app.core.exceptions import ValidationError
+from app.core.exceptions import ValidationError, AppException
 from app.middleware.auth_middleware import require_auth
 
 
@@ -21,6 +21,7 @@ market_data_bp = Blueprint("market_data", url_prefix="/api/market")
 @openapi.response(200, description="Quote data retrieved successfully")
 @openapi.response(401, description="Not authenticated")
 @openapi.response(422, description="Validation error")
+@openapi.response(503, description="Market data unavailable (MT5 offline/stale)")
 @require_auth
 async def get_quote(request: Request, ticker: str):
     """
@@ -48,6 +49,9 @@ async def get_quote(request: Request, ticker: str):
 
         return response.json(quote, status=200)
 
+    except AppException:
+        # Deixe AppExceptions (inclui MarketDataUnavailableError=503) propagarem para o handler global
+        raise
     except Exception as e:
         logger.error("Failed to get quote", ticker=ticker, error=str(e))
         raise ValidationError(f"Failed to get quote: {str(e)}")
@@ -93,6 +97,8 @@ async def get_option_chain(request: Request, ticker: str):
 
         return response.json(chain, status=200)
 
+    except AppException:
+        raise
     except Exception as e:
         logger.error("Failed to get option chain", ticker=ticker, error=str(e))
         raise ValidationError(f"Failed to get option chain: {str(e)}")
@@ -154,6 +160,8 @@ async def get_option_quote(request: Request, ticker: str):
 
     except ValidationError:
         raise
+    except AppException:
+        raise
     except Exception as e:
         logger.error("Failed to get option quote", ticker=ticker, error=str(e))
         raise ValidationError(f"Failed to get option quote: {str(e)}")
@@ -214,6 +222,8 @@ async def get_greeks(request: Request, ticker: str):
         return response.json(greeks, status=200)
 
     except ValidationError:
+        raise
+    except AppException:
         raise
     except Exception as e:
         logger.error("Failed to get greeks", ticker=ticker, error=str(e))
