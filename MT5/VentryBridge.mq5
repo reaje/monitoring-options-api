@@ -502,13 +502,7 @@ void SendOptionQuotes()
             json += ",";
 
         // Adicionar option quote (usa mt5_symbol como identificador)
-        json += CJsonHelper::AddOptionQuote(
-            symbol,      // mt5_symbol (ex: VALEC125)
-            tick.bid,
-            tick.ask,
-            tick.last,
-            volume
-        );
+        json += CJsonHelper::AddOptionQuote(symbol, tick.bid, tick.ask, tick.last, volume);
 
         quotes_added++;
     }
