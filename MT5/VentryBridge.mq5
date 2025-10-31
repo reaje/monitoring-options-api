@@ -23,7 +23,8 @@ input string    InpTerminalId = "MT5-WS-01";                 // ID único deste 
 input string    InpBroker = "XP";                             // Nome do broker
 
 input group "=== Símbolos para Monitorar ==="
-input string    InpSymbolsList = "PETR4,VALE3,BBAS3";        // Lista de símbolos (separados por vírgula)
+input string    InpSymbolsList = "PETR4,VALE3,BBAS3";        // Lista de símbolos de ações (separados por vírgula)
+input string    InpOptionsSymbolsList = "";                   // Lista de símbolos de opções (separados por vírgula) - MT5 format
 
 input group "=== Intervalos de Envio (em segundos) ==="
 input int       InpHeartbeatInterval = 60;                    // Intervalo de heartbeat (60s)
@@ -38,8 +39,11 @@ input int       InpHttpTimeout = 5000;                        // Timeout HTTP em
 CHttpClient*    g_http_client = NULL;
 string          g_symbols[];
 int             g_symbols_count = 0;
+string          g_option_symbols[];
+int             g_option_symbols_count = 0;
 datetime        g_last_heartbeat = 0;
 datetime        g_last_quotes = 0;
+datetime        g_last_option_quotes = 0;
 datetime        g_last_commands_poll = 0;
 string          g_account_number;
 int             g_terminal_build;
@@ -72,17 +76,34 @@ int OnInit()
     // Criar cliente HTTP
     g_http_client = new CHttpClient(InpBackendUrl, InpAuthToken, InpHttpTimeout);
 
-    // Processar lista de símbolos
+    // Processar lista de símbolos de ações
     if(!ParseSymbols())
     {
-        Print("ERRO: Falha ao processar lista de símbolos!");
+        Print("ERRO: Falha ao processar lista de símbolos de ações!");
         return INIT_FAILED;
     }
 
-    Print("Símbolos monitorados: ", g_symbols_count);
+    Print("Símbolos de ações monitorados: ", g_symbols_count);
     for(int i = 0; i < g_symbols_count; i++)
     {
         Print("  - ", g_symbols[i]);
+    }
+
+    // Processar lista de símbolos de opções (opcional)
+    if(InpOptionsSymbolsList != "")
+    {
+        if(!ParseOptionSymbols())
+        {
+            Print("AVISO: Falha ao processar lista de símbolos de opções (continuando sem elas)");
+        }
+        else
+        {
+            Print("Símbolos de opções monitorados: ", g_option_symbols_count);
+            for(int i = 0; i < g_option_symbols_count; i++)
+            {
+                Print("  - ", g_option_symbols[i]);
+            }
+        }
     }
 
     // Configurar timer
@@ -126,6 +147,7 @@ void OnDeinit(const int reason)
     }
 
     ArrayFree(g_symbols);
+    ArrayFree(g_option_symbols);
     g_initialized = false;
 
     Print("=== Ventry Bridge EA - Finalizado ===");
@@ -148,11 +170,18 @@ void OnTimer()
         g_last_heartbeat = now;
     }
 
-    // Quotes
+    // Quotes (ações)
     if(now - g_last_quotes >= InpQuotesInterval)
     {
         SendQuotes();
         g_last_quotes = now;
+    }
+
+    // Option quotes (se houver símbolos de opções configurados)
+    if(g_option_symbols_count > 0 && now - g_last_option_quotes >= InpQuotesInterval)
+    {
+        SendOptionQuotes();
+        g_last_option_quotes = now;
     }
 
     // Commands polling
@@ -390,6 +419,125 @@ void PollCommands()
 
     // TODO: Fase 3 - Processar comandos recebidos
     // Por enquanto, apenas loga
+}
+
+//+------------------------------------------------------------------+
+//| Processa a lista de símbolos de opções do input                 |
+//+------------------------------------------------------------------+
+bool ParseOptionSymbols()
+{
+    string symbols_str = InpOptionsSymbolsList;
+    StringTrimLeft(symbols_str);
+    StringTrimRight(symbols_str);
+
+    if(symbols_str == "")
+        return false;
+
+    // Contar símbolos (separados por vírgula)
+    int count = 1;
+    for(int i = 0; i < StringLen(symbols_str); i++)
+    {
+        if(StringGetCharacter(symbols_str, i) == ',')
+            count++;
+    }
+
+    ArrayResize(g_option_symbols, count);
+    g_option_symbols_count = 0;
+
+    // Extrair cada símbolo
+    int start = 0;
+    for(int i = 0; i <= StringLen(symbols_str); i++)
+    {
+        if(i == StringLen(symbols_str) || StringGetCharacter(symbols_str, i) == ',')
+        {
+            string symbol = StringSubstr(symbols_str, start, i - start);
+            StringTrimLeft(symbol);
+            StringTrimRight(symbol);
+
+            if(symbol != "")
+            {
+                g_option_symbols[g_option_symbols_count] = symbol;
+                g_option_symbols_count++;
+            }
+
+            start = i + 1;
+        }
+    }
+
+    return (g_option_symbols_count > 0);
+}
+
+//+------------------------------------------------------------------+
+//| Envia cotações de opções para o backend                         |
+//+------------------------------------------------------------------+
+void SendOptionQuotes()
+{
+    if(g_http_client == NULL || g_option_symbols_count == 0)
+        return;
+
+    // Iniciar JSON
+    string json = CJsonHelper::StartOptionQuotesJson(InpTerminalId, g_account_number);
+
+    int quotes_added = 0;
+
+    // Adicionar cotação de cada símbolo de opção
+    for(int i = 0; i < g_option_symbols_count; i++)
+    {
+        string symbol = g_option_symbols[i];
+        MqlTick tick;
+
+        // Obter último tick do símbolo
+        if(!SymbolInfoTick(symbol, tick))
+        {
+            if(InpEnableLogging)
+                Print("AVISO: Não foi possível obter tick de opção ", symbol);
+            continue;
+        }
+
+        // Obter volume do tick
+        long volume = (long)tick.volume;
+
+        // Adicionar vírgula se não for o primeiro
+        if(quotes_added > 0)
+            json += ",";
+
+        // Adicionar option quote (usa mt5_symbol como identificador)
+        json += CJsonHelper::AddOptionQuote(
+            symbol,      // mt5_symbol (ex: VALEC125)
+            tick.bid,
+            tick.ask,
+            tick.last,
+            volume
+        );
+
+        quotes_added++;
+    }
+
+    // Finalizar JSON
+    json += CJsonHelper::EndOptionQuotesJson();
+
+    if(quotes_added == 0)
+    {
+        if(InpEnableLogging)
+            Print("AVISO: Nenhuma cotação de opção disponível para enviar");
+        return;
+    }
+
+    if(InpEnableLogging)
+        Print("Enviando ", quotes_added, " cotações de opções...");
+
+    string response;
+    bool success = g_http_client.Post("/api/mt5/option_quotes", json, response);
+
+    if(success)
+    {
+        if(InpEnableLogging)
+            Print("Cotações de opções enviadas com sucesso. Resposta: ", response);
+    }
+    else
+    {
+        Print("ERRO: Falha ao enviar cotações de opções!");
+    }
 }
 
 //+------------------------------------------------------------------+

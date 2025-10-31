@@ -182,4 +182,43 @@ public:
         string search = "\"" + key + "\":[]";
         return (StringFind(json, search) != -1);
     }
+
+    //+------------------------------------------------------------------+
+    //| Inicia JSON de option quotes                                    |
+    //+------------------------------------------------------------------+
+    static string StartOptionQuotesJson(string terminal_id, string account_number)
+    {
+        string json = "{";
+        json += "\"terminal_id\":\"" + EscapeString(terminal_id) + "\",";
+        json += "\"account_number\":\"" + EscapeString(account_number) + "\",";
+        json += "\"option_quotes\":[";
+
+        return json;
+    }
+
+    //+------------------------------------------------------------------+
+    //| Adiciona uma option quote ao JSON                               |
+    //+------------------------------------------------------------------+
+    static string AddOptionQuote(string mt5_symbol, double bid, double ask,
+                                 double last, long volume)
+    {
+        string json = "{";
+        json += "\"mt5_symbol\":\"" + EscapeString(mt5_symbol) + "\",";
+        json += "\"bid\":" + DoubleToString(bid, 8) + ",";
+        json += "\"ask\":" + DoubleToString(ask, 8) + ",";
+        json += "\"last\":" + DoubleToString(last, 8) + ",";
+        json += "\"volume\":" + IntegerToString(volume) + ",";
+        json += "\"ts\":\"" + FormatTimestamp(TimeCurrent()) + "\"";
+        json += "}";
+
+        return json;
+    }
+
+    //+------------------------------------------------------------------+
+    //| Finaliza JSON de option quotes                                  |
+    //+------------------------------------------------------------------+
+    static string EndOptionQuotesJson()
+    {
+        return "]}";
+    }
 };
