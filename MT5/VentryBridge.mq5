@@ -14,24 +14,24 @@
 #include <JsonHelper.mqh>
 
 //--- Inputs configuráveis
-input group "=== Configurações do Servidor ==="
+//=== Configurações do Servidor ===
 input string    InpBackendUrl = "http://localhost:8000";     // URL do Backend (sem / no final)
 input string    InpAuthToken = "";                            // Bearer Token para autenticação
 
-input group "=== Identificação do Terminal ==="
+//=== Identificação do Terminal ===
 input string    InpTerminalId = "MT5-WS-01";                 // ID único deste terminal
 input string    InpBroker = "XP";                             // Nome do broker
 
-input group "=== Símbolos para Monitorar ==="
+//=== Símbolos para Monitorar ===
 input string    InpSymbolsList = "PETR4,VALE3,BBAS3";        // Lista de símbolos de ações (separados por vírgula)
 input string    InpOptionsSymbolsList = "";                   // Lista de símbolos de opções (separados por vírgula) - MT5 format
 
-input group "=== Intervalos de Envio (em segundos) ==="
+//=== Intervalos de Envio (em segundos) ===
 input int       InpHeartbeatInterval = 60;                    // Intervalo de heartbeat (60s)
 input int       InpQuotesInterval = 5;                        // Intervalo de envio de cotações (5s)
 input int       InpCommandsPollInterval = 10;                 // Intervalo de polling de comandos (10s)
 
-input group "=== Configurações Avançadas ==="
+//=== Configurações Avançadas ===
 input bool      InpEnableLogging = true;                      // Habilitar logs detalhados
 input int       InpHttpTimeout = 5000;                        // Timeout HTTP em ms (5000ms)
 
