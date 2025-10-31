@@ -21,6 +21,9 @@ _HEARTBEATS: Dict[str, Dict[str, Any]] = {}
 # Last quote per symbol (uppercase)
 _QUOTES: Dict[str, Dict[str, Any]] = {}
 
+# Last option quote per option key (ticker_strike_type_expiration)
+_OPTIONS_QUOTES: Dict[str, Dict[str, Any]] = {}
+
 # Config
 QUOTE_TTL_SECONDS = int(getattr(settings, "MT5_BRIDGE_QUOTE_TTL_SECONDS", 10))
 
@@ -110,6 +113,77 @@ def get_latest_quote(symbol: str, ttl_seconds: Optional[int] = None) -> Optional
         return dict(entry)
 
 
+def upsert_option_quotes(payload: Dict[str, Any]) -> int:
+    """
+    Store option quotes received from MT5.
+
+    Args:
+        payload: Dict with structure:
+            {
+                "terminal_id": "MT5-WS-01",
+                "account_number": "4472007",
+                "option_quotes": [
+                    {
+                        "mt5_symbol": "VALEC125",
+                        "ticker": "VALE3",
+                        "strike": 62.50,
+                        "option_type": "call",
+                        "expiration": "2024-03-15",
+                        "bid": 2.50,
+                        "ask": 2.55,
+                        "last": 2.52,
+                        "volume": 1000,
+                        "ts": "2024-10-31T14:30:00Z"
+                    }
+                ]
+            }
+
+    Returns:
+        Number of quotes accepted
+    """
+    quotes = payload.get("option_quotes") or []
+    terminal_id = payload.get("terminal_id")
+    account_number = payload.get("account_number")
+    accepted = 0
+    now_iso = _utcnow_iso()
+
+    with _lock:
+        for q in quotes:
+            ticker = str(q.get("ticker") or "").upper().strip()
+            strike = q.get("strike")
+            option_type = str(q.get("option_type") or "").lower().strip()
+            expiration = str(q.get("expiration") or "").strip()
+
+            if not all([ticker, strike, option_type, expiration]):
+                continue
+
+            # Build unique key: ticker_strike_type_expiration
+            # Example: VALE3_62.50_call_2024-03-15
+            option_key = _build_option_key(ticker, strike, option_type, expiration)
+
+            entry = {
+                "ticker": ticker,
+                "strike": _safe_float(strike),
+                "option_type": option_type,
+                "expiration": expiration,
+                "mt5_symbol": q.get("mt5_symbol"),
+                "bid": _safe_float(q.get("bid")),
+                "ask": _safe_float(q.get("ask")),
+                "last": _safe_float(q.get("last")),
+                "volume": _safe_float(q.get("volume")),
+                "source": "mt5",
+                "ts": q.get("ts") or q.get("timestamp") or now_iso,
+                "terminal_id": terminal_id,
+                "account_number": account_number,
+                "updated_at": now_iso,
+            }
+
+            _OPTIONS_QUOTES[option_key] = entry
+            accepted += 1
+
+    return accepted
+
+
 def get_latest_option_quote(
     ticker: str,
     strike: float,
@@ -118,10 +192,89 @@ def get_latest_option_quote(
     ttl_seconds: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Placeholder: Fase 1 não usa cotações de opções via MT5.
-    Retorna None para sempre delegar ao fallback provider.
+    Get the latest option quote from cache (if within TTL).
+
+    Args:
+        ticker: Ticker symbol (e.g., "VALE3")
+        strike: Strike price (e.g., 62.50)
+        expiration: Expiration date ISO string (e.g., "2024-03-15")
+        option_type: Option type ("call" or "put")
+        ttl_seconds: TTL in seconds (default: QUOTE_TTL_SECONDS)
+
+    Returns:
+        Quote dict if found and not expired, None otherwise
     """
-    return None
+    ticker = (ticker or "").upper().strip()
+    option_type = (option_type or "").lower().strip()
+    expiration = (expiration or "").strip()
+
+    if not all([ticker, strike, option_type, expiration]):
+        return None
+
+    option_key = _build_option_key(ticker, strike, option_type, expiration)
+    ttl = int(ttl_seconds or QUOTE_TTL_SECONDS)
+    now = datetime.now(timezone.utc)
+
+    with _lock:
+        entry = _OPTIONS_QUOTES.get(option_key)
+        if not entry:
+            return None
+
+        ts = _parse_ts_iso(entry.get("ts"))
+        age = (now - ts).total_seconds()
+
+        if age > ttl:
+            return None
+
+        return dict(entry)
+
+
+def get_all_option_quotes(max_age_seconds: Optional[int] = None) -> Dict[str, Dict[str, Any]]:
+    """
+    Get all option quotes from cache (optionally filtered by age).
+
+    Args:
+        max_age_seconds: Maximum age in seconds (default: no filter)
+
+    Returns:
+        Dict mapping option_key -> quote
+    """
+    now = datetime.now(timezone.utc)
+    max_age = max_age_seconds
+
+    with _lock:
+        if max_age is None:
+            # Return all quotes
+            return {k: dict(v) for k, v in _OPTIONS_QUOTES.items()}
+
+        # Filter by age
+        result = {}
+        for key, entry in _OPTIONS_QUOTES.items():
+            ts = _parse_ts_iso(entry.get("ts"))
+            age = (now - ts).total_seconds()
+            if age <= max_age:
+                result[key] = dict(entry)
+
+        return result
+
+
+def _build_option_key(ticker: str, strike: float, option_type: str, expiration: str) -> str:
+    """
+    Build a unique key for an option.
+
+    Args:
+        ticker: Ticker symbol
+        strike: Strike price
+        option_type: "call" or "put"
+        expiration: Expiration date string
+
+    Returns:
+        Unique key string
+    """
+    ticker = ticker.upper().strip()
+    option_type = option_type.lower().strip()
+    expiration = expiration.strip()
+    return f"{ticker}_{strike}_{option_type}_{expiration}"
 
 
 def _safe_float(v: Any) -> Optional[float]:

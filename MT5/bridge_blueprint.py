@@ -17,7 +17,8 @@ from app.config import settings
 from typing import Any, Dict
 
 from app.core.logger import logger
-from .storage import upsert_heartbeat, upsert_quotes
+from .storage import upsert_heartbeat, upsert_quotes, upsert_option_quotes
+from .symbol_mapper import get_mapper
 
 mt5_bridge_bp = Blueprint("mt5_bridge", url_prefix="/api/mt5")
 
@@ -105,6 +106,91 @@ async def commands(request: Request):
         return deny
     # Fase 1: fila vazia
     return response.json({"commands": []}, status=200)
+
+
+@mt5_bridge_bp.post("/option_quotes")
+@openapi.tag("MT5 Bridge")
+@openapi.summary("Recebe cotações de opções do MT5 com mapeamento automático")
+async def option_quotes(request: Request):
+    deny = _require_enabled_and_auth(request)
+    if deny:
+        return deny
+
+    # Parse JSON payload
+    try:
+        payload: Dict[str, Any] = request.json or {}
+    except Exception as e:
+        logger.error("mt5.option_quotes.json_parse_error", error=str(e), error_type=type(e).__name__)
+        return response.json({
+            "error": "invalid_json",
+            "details": str(e)
+        }, status=400)
+
+    # Process option quotes with symbol mapping
+    try:
+        mapper = get_mapper()
+        option_quotes_raw = payload.get("option_quotes") or []
+        mapped_quotes = []
+        mapping_errors = []
+
+        for idx, quote in enumerate(option_quotes_raw):
+            mt5_symbol = quote.get("mt5_symbol")
+
+            if not mt5_symbol:
+                mapping_errors.append({"index": idx, "error": "missing_mt5_symbol"})
+                continue
+
+            try:
+                # Decode MT5 symbol to backend format
+                decoded = mapper.decode_mt5_symbol(mt5_symbol)
+
+                # Add mapped information to quote
+                quote.update({
+                    "ticker": decoded["ticker"],
+                    "strike": decoded["strike"],
+                    "option_type": decoded["option_type"],
+                    "expiration": decoded["expiration_date"],
+                })
+
+                mapped_quotes.append(quote)
+
+            except ValueError as e:
+                # Mapping failed
+                logger.warning(
+                    "mt5.option_quotes.mapping_failed",
+                    mt5_symbol=mt5_symbol,
+                    error=str(e)
+                )
+                mapping_errors.append({
+                    "index": idx,
+                    "mt5_symbol": mt5_symbol,
+                    "error": str(e)
+                })
+
+        # Store mapped quotes
+        payload_with_mapped = {
+            **payload,
+            "option_quotes": mapped_quotes
+        }
+
+        accepted = upsert_option_quotes(payload_with_mapped)
+
+        logger.info(
+            "mt5.option_quotes",
+            count=accepted,
+            total_received=len(option_quotes_raw),
+            mapping_errors=len(mapping_errors)
+        )
+
+        return response.json({
+            "accepted": accepted,
+            "total": len(option_quotes_raw),
+            "mapping_errors": mapping_errors if mapping_errors else None
+        }, status=202)
+
+    except Exception as e:
+        logger.error("mt5.option_quotes.processing_error", error=str(e))
+        return response.json({"error": "processing_error", "details": str(e)}, status=500)
 
 
 @mt5_bridge_bp.post("/execution_report")
