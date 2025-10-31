@@ -10,8 +10,8 @@
 #property strict
 
 // Incluir bibliotecas auxiliares
-#include "Include/HttpClient.mqh"
-#include "Include/JsonHelper.mqh"
+#include "HttpClient.mqh"
+#include "JsonHelper.mqh"
 
 //--- Inputs configuráveis
 //=== Configurações do Servidor ===
