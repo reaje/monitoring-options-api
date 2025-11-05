@@ -3,6 +3,8 @@
 from typing import List, Dict, Any
 from uuid import UUID
 from datetime import datetime, date
+from zoneinfo import ZoneInfo
+
 import asyncio
 from app.database.repositories.options import OptionsRepository
 from app.database.repositories.rules import RulesRepository
@@ -11,6 +13,23 @@ from app.database.repositories.accounts import AccountsRepository
 from app.database.repositories.assets import AssetsRepository
 from app.services.market_data import market_data_provider
 from app.core.logger import logger
+
+from app.config import settings
+
+# Checagem de pregão da B3 via configuração (.env)
+# Usa time zone e janela configuráveis em app.config.Settings
+def _is_b3_market_open():
+    tz = settings.MARKET_SESSION_TZ or "America/Sao_Paulo"
+    sp_now = datetime.now(ZoneInfo(tz))
+    if sp_now.weekday() >= 5:  # 0=Seg, 6=Dom
+        return False, sp_now
+    open_hhmm = (int(settings.MARKET_OPEN_HOUR), int(settings.MARKET_OPEN_MINUTE))
+    close_hhmm = (int(settings.MARKET_CLOSE_HOUR), int(settings.MARKET_CLOSE_MINUTE))
+    hhmm = (sp_now.hour, sp_now.minute)
+    if hhmm < open_hhmm or hhmm >= close_hhmm:
+        return False, sp_now
+    return True, sp_now
+
 
 
 class MonitorWorker:
@@ -34,6 +53,22 @@ class MonitorWorker:
             check_number=self.check_count,
             timestamp=datetime.utcnow().isoformat()
         )
+
+
+        # Pular execuções fora do horário de pregão da B3
+        open_now, sp_now = _is_b3_market_open()
+        if not open_now:
+            logger.debug(
+                "Monitor worker ignorado: mercado fechado (B3 10:00–18:00 America/Sao_Paulo)",
+                sp_time=sp_now.isoformat(),
+            )
+            return {
+                "check_number": self.check_count,
+                "timestamp": datetime.utcnow().isoformat(),
+                "status": "skipped",
+                "reason": "market_closed",
+                "sp_time": sp_now.isoformat(),
+            }
 
         try:
             # Get all accounts

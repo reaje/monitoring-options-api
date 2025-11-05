@@ -2,8 +2,26 @@
 
 from typing import Dict, Any
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from app.services.notification_service import notification_service
 from app.core.logger import logger
+from app.config import settings
+
+
+# Checagem de pregão da B3 via configuração (.env)
+# Usa time zone e janela configuráveis em app.config.Settings
+def _is_b3_market_open():
+    tz = settings.MARKET_SESSION_TZ or "America/Sao_Paulo"
+    sp_now = datetime.now(ZoneInfo(tz))
+    if sp_now.weekday() >= 5:  # 0=Seg, 6=Dom
+        return False, sp_now
+    open_hhmm = (int(settings.MARKET_OPEN_HOUR), int(settings.MARKET_OPEN_MINUTE))
+    close_hhmm = (int(settings.MARKET_CLOSE_HOUR), int(settings.MARKET_CLOSE_MINUTE))
+    hhmm = (sp_now.hour, sp_now.minute)
+    if hhmm < open_hhmm or hhmm >= close_hhmm:
+        return False, sp_now
+    return True, sp_now
 
 
 class NotifierWorker:
@@ -28,6 +46,22 @@ class NotifierWorker:
             run_number=self.run_count,
             timestamp=datetime.utcnow().isoformat()
         )
+
+        # Pular execucoes fora do horario de pregao da B3
+        open_now, sp_now = _is_b3_market_open()
+        if not open_now:
+            logger.debug(
+                "Notifier worker ignorado: mercado fechado (B3 10:00-18:00 America/Sao_Paulo)",
+                sp_time=sp_now.isoformat(),
+            )
+            return {
+                "run_number": self.run_count,
+                "timestamp": datetime.utcnow().isoformat(),
+                "status": "skipped",
+                "reason": "market_closed",
+                "sp_time": sp_now.isoformat(),
+            }
+
 
         try:
             # Process pending alerts using notification service

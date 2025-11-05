@@ -7,6 +7,9 @@ from app.services.market_data import market_data_provider
 from app.core.logger import logger
 from app.core.exceptions import ValidationError, AppException
 from app.middleware.auth_middleware import require_auth
+from datetime import datetime
+from app.config import settings
+
 
 
 market_data_bp = Blueprint("market_data", url_prefix="/api/market")
@@ -67,6 +70,8 @@ async def get_quote(request: Request, ticker: str):
 @openapi.response(200, description="Option chain data")
 @openapi.response(401, description="Not authenticated")
 @openapi.response(422, description="Validation error")
+@openapi.response(503, description="Market data unavailable (MT5 offline/stale)")
+
 @require_auth
 async def get_option_chain(request: Request, ticker: str):
     """
@@ -114,6 +119,8 @@ async def get_option_chain(request: Request, ticker: str):
 @openapi.parameter("type", str, "query", required=True, description="Option type: CALL or PUT")
 @openapi.secured("BearerAuth")
 @openapi.response(200, description="Option quote with premium and greeks")
+@openapi.response(503, description="Market data unavailable (MT5 offline/stale)")
+
 @openapi.response(401, description="Not authenticated")
 @openapi.response(422, description="Validation error")
 @require_auth
@@ -175,6 +182,8 @@ async def get_option_quote(request: Request, ticker: str):
 @openapi.parameter("strike", float, "query", required=True, description="Strike price")
 @openapi.parameter("expiration", str, "query", required=True, description="Expiration date (YYYY-MM-DD)")
 @openapi.parameter("type", str, "query", required=True, description="Option type: CALL or PUT")
+@openapi.response(503, description="Market data unavailable (MT5 offline/stale)")
+
 @openapi.secured("BearerAuth")
 @openapi.response(200, description="Option greeks")
 @openapi.response(401, description="Not authenticated")
@@ -252,9 +261,9 @@ async def market_data_health(request: Request):
 
         return response.json(
             {
-                "provider": "mock",  # or get from config
+                "provider": settings.MARKET_DATA_PROVIDER,
                 "healthy": is_healthy,
-                "timestamp": "timestamp"
+                "timestamp": datetime.utcnow().isoformat()
             },
             status=200 if is_healthy else 503
         )
@@ -263,9 +272,10 @@ async def market_data_health(request: Request):
         logger.error("Market data health check failed", error=str(e))
         return response.json(
             {
-                "provider": "mock",
+                "provider": settings.MARKET_DATA_PROVIDER,
                 "healthy": False,
-                "error": str(e)
+                "error": str(e),
+                "timestamp": datetime.utcnow().isoformat()
             },
             status=503
         )

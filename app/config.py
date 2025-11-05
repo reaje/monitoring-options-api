@@ -57,6 +57,16 @@ class Settings(BaseSettings):
     MAX_NOTIFICATION_RETRIES: int = 3
 
     # =====================================
+    # MARKET HOURS CONFIGURATION
+    # =====================================
+    MARKET_SESSION_TZ: str = "America/Sao_Paulo"
+    MARKET_OPEN_HOUR: int = 10
+    MARKET_OPEN_MINUTE: int = 0
+    MARKET_CLOSE_HOUR: int = 18
+    MARKET_CLOSE_MINUTE: int = 0
+
+
+    # =====================================
     # RULES ENGINE CONFIGURATION
     # =====================================
     DEFAULT_DELTA_THRESHOLD: float = 0.60

@@ -63,6 +63,22 @@ def get_last_heartbeat(terminal_id: str) -> Optional[Dict[str, Any]]:
         return _HEARTBEATS.get(terminal_id)
 
 
+
+def get_all_heartbeats(max_age_seconds: Optional[int] = None) -> Dict[str, Dict[str, Any]]:
+    """Retorna todos os heartbeats (opcionalmente filtrados por idade)."""
+    now = datetime.now(timezone.utc)
+    with _lock:
+        if max_age_seconds is None:
+            return {k: dict(v) for k, v in _HEARTBEATS.items()}
+        result: Dict[str, Dict[str, Any]] = {}
+        for term_id, entry in _HEARTBEATS.items():
+            ts = _parse_ts_iso(entry.get("updated_at") or entry.get("ts"))
+            age = (now - ts).total_seconds()
+            if age <= max_age_seconds:
+                result[term_id] = dict(entry)
+        return result
+
+
 def upsert_quotes(payload: Dict[str, Any]) -> int:
     quotes = payload.get("quotes") or []
     terminal_id = payload.get("terminal_id")
@@ -95,6 +111,22 @@ def upsert_quotes(payload: Dict[str, Any]) -> int:
 
     return accepted
 
+
+
+
+def get_all_quotes(max_age_seconds: Optional[int] = None) -> Dict[str, Dict[str, Any]]:
+    """Retorna todas as cotações de subjacentes (opcionalmente filtradas por idade)."""
+    now = datetime.now(timezone.utc)
+    with _lock:
+        if max_age_seconds is None:
+            return {k: dict(v) for k, v in _QUOTES.items()}
+        result: Dict[str, Dict[str, Any]] = {}
+        for sym, entry in _QUOTES.items():
+            ts = _parse_ts_iso(entry.get("ts"))
+            age = (now - ts).total_seconds()
+            if age <= max_age_seconds:
+                result[sym] = dict(entry)
+        return result
 
 def get_latest_quote(symbol: str, ttl_seconds: Optional[int] = None) -> Optional[Dict[str, Any]]:
     sym = (symbol or "").upper().strip()

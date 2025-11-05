@@ -18,6 +18,9 @@ from typing import Any, Dict
 
 from app.core.logger import logger
 from .storage import upsert_heartbeat, upsert_quotes, upsert_option_quotes
+from datetime import datetime, timezone
+from .storage import get_all_heartbeats, get_all_quotes, QUOTE_TTL_SECONDS
+
 from .symbol_mapper import get_mapper
 
 mt5_bridge_bp = Blueprint("mt5_bridge", url_prefix="/api/mt5")
@@ -187,10 +190,103 @@ async def option_quotes(request: Request):
             "total": len(option_quotes_raw),
             "mapping_errors": mapping_errors if mapping_errors else None
         }, status=202)
-
     except Exception as e:
-        logger.error("mt5.option_quotes.processing_error", error=str(e))
-        return response.json({"error": "processing_error", "details": str(e)}, status=500)
+        logger.error(
+            "mt5.option_quotes.processing_error",
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+        return response.json({
+            "error": "processing_error",
+            "details": str(e),
+        }, status=500)
+
+@mt5_bridge_bp.get("/health")
+@openapi.tag("MT5 Bridge")
+@openapi.summary("Saúde do bridge MT5 (heartbeats e cotações)")
+async def mt5_health(request: Request):
+    deny = _require_enabled_and_auth(request)
+    if deny:
+        return deny
+
+    now = datetime.now(timezone.utc)
+
+    # Heartbeats
+    heartbeats = get_all_heartbeats()
+    latest_hb = None
+    latest_hb_age = None
+    if heartbeats:
+        # Seleciona o mais recente por updated_at/ts
+        def hb_ts(hb):
+            ts = hb.get("updated_at") or hb.get("ts")
+            try:
+                if isinstance(ts, str) and ts.endswith("Z"):
+                    ts = ts[:-1] + "+00:00"
+                return datetime.fromisoformat(ts).astimezone(timezone.utc)
+            except Exception:
+                return now
+        latest_hb = max(heartbeats.values(), key=hb_ts)
+        latest_hb_ts = hb_ts(latest_hb)
+        latest_hb_age = (now - latest_hb_ts).total_seconds()
+
+    # Quotes (subjacentes)
+    quotes = get_all_quotes()
+    fresh_quotes = 0
+    stale_quotes = 0
+    quotes_summary = {}
+    for sym, q in quotes.items():
+        try:
+            ts = q.get("ts")
+            if isinstance(ts, str) and ts.endswith("Z"):
+                ts = ts[:-1] + "+00:00"
+            qts = datetime.fromisoformat(ts).astimezone(timezone.utc)
+        except Exception:
+            qts = now
+        age = (now - qts).total_seconds()
+        is_fresh = age <= float(QUOTE_TTL_SECONDS)
+        fresh_quotes += 1 if is_fresh else 0
+        stale_quotes += 0 if is_fresh else 1
+        # Amostra compacta por símbolo
+        quotes_summary[sym] = {
+            "last": q.get("last"),
+            "bid": q.get("bid"),
+            "ask": q.get("ask"),
+            "ts": q.get("ts"),
+            "age_seconds": age,
+            "is_fresh": is_fresh,
+        }
+
+    # Status: ok, degraded, unhealthy
+    hb_recent = latest_hb_age is not None and latest_hb_age <= 60
+    has_fresh_quotes = fresh_quotes > 0
+    if hb_recent and has_fresh_quotes:
+        status = "ok"
+    elif hb_recent or has_fresh_quotes or stale_quotes > 0:
+        status = "degraded"
+    else:
+        status = "unhealthy"
+
+    result = {
+        "status": status,
+        "bridge_enabled": BRIDGE_ENABLED,
+        "quote_ttl_seconds": QUOTE_TTL_SECONDS,
+        "heartbeat": {
+            "terminals": len(heartbeats),
+            "latest": latest_hb,
+            "latest_age_seconds": latest_hb_age,
+        },
+        "quotes": {
+            "symbols_total": len(quotes),
+            "fresh": fresh_quotes,
+            "stale": stale_quotes,
+            "sample": dict(list(quotes_summary.items())[:10]),
+        },
+        "timestamp": now.isoformat().replace("+00:00", "Z"),
+    }
+
+    return response.json(result, status=200)
+
+
 
 
 @mt5_bridge_bp.post("/execution_report")
