@@ -7,7 +7,12 @@ from app.services.communications_client import comm_client
 from app.database.repositories.alerts import AlertQueueRepository
 from app.database.repositories.alert_logs import AlertLogsRepository
 from app.database.repositories.accounts import AccountsRepository
+from app.database.repositories.options import OptionsRepository
+from app.database.repositories.assets import AssetsRepository
 from app.core.logger import logger
+from app.config import settings
+from app.services.market_data import get_market_data_provider
+from app.services.market_data.brapi_provider import brapi_provider
 
 
 class NotificationService:
@@ -16,7 +21,7 @@ class NotificationService:
     def __init__(self):
         """Initialize notification service."""
         self.comm_client = comm_client
-        self.max_retries = 3
+        self.max_retries = getattr(settings, "MAX_NOTIFICATION_RETRIES", 3)
         self.retry_delay = 5  # seconds
 
     async def process_alert(self, alert: Dict[str, Any]) -> bool:
@@ -44,9 +49,181 @@ class NotificationService:
                 return False
 
             # Get notification channels and target from account or alert payload
-            channels = alert.get("payload", {}).get("channels", ["whatsapp"])
-            phone = account.get("phone") or alert.get("payload", {}).get("phone")
+            # Normalizar payload (alguns registros antigos podem ter JSON serializado como string)
+            import json as _json
+            _payload = alert.get("payload") or {}
+            if isinstance(_payload, str):
+                try:
+                    _payload = _json.loads(_payload)
+                except Exception:
+                    _payload = {}
+            alert["payload"] = _payload
+
+            # Normalizar canais para lista
+            _channels = _payload.get("channels") or []
+            if isinstance(_channels, str):
+                try:
+                    parsed = _json.loads(_channels)
+                    _channels = parsed if isinstance(parsed, list) else [_channels]
+                except Exception:
+                    _channels = [_channels]
+            elif not isinstance(_channels, list):
+                _channels = []
+            channels = list(dict.fromkeys(_channels + ["whatsapp", "sms"]))
+
+            phone = account.get("phone") or _payload.get("phone")
             email = account.get("email")
+
+            # Enriquecer payload legado/incompleto on-the-fly (e persistir no banco)
+            try:
+                payload = alert.get("payload") or {}
+                def _is_missing(v):
+                    return v is None or (isinstance(v, str) and (v.strip() == "" or v.strip().upper() == "N/A"))
+                if alert.get("reason") == "roll_trigger":
+                    missing_core = any(_is_missing(payload.get(k)) for k in ["ticker", "side", "strike", "expiration", "dte"])
+                    if missing_core:
+                        pos_id = alert.get("option_position_id")
+                        if pos_id:
+                            from uuid import UUID as _UUID
+                            pos = await OptionsRepository.get_by_id(_UUID(str(pos_id)))
+                            patch: Dict[str, Any] = {}
+                            if pos:
+                                # Buscar ticker via asset
+                                ticker: Optional[str] = payload.get("ticker")
+                                if not ticker and pos.get("asset_id"):
+                                    asset = await AssetsRepository.get_by_id(_UUID(str(pos.get("asset_id"))))
+                                    if asset:
+                                        ticker = asset.get("ticker")
+                                patch["ticker"] = ticker or pos.get("ticker")
+                                patch["side"] = payload.get("side") or pos.get("side")
+                                patch["strike"] = payload.get("strike") or pos.get("strike")
+                                patch["expiration"] = payload.get("expiration") or pos.get("expiration")
+                                patch["quantity"] = payload.get("quantity") or pos.get("quantity")
+                                patch["avg_premium"] = payload.get("avg_premium") or pos.get("avg_premium")
+                                # Calcular DTE se necessario
+                                if _is_missing(payload.get("dte")) and patch.get("expiration"):
+                                    from datetime import date as _date, datetime as _dt
+                                    exp = patch.get("expiration")
+                                    if isinstance(exp, str):
+                                        try:
+                                            exp_d = _dt.fromisoformat(exp).date()
+                                        except Exception:
+                                            exp_d = None
+                                    elif isinstance(exp, _dt):
+                                        exp_d = exp.date()
+                                    else:
+                                        exp_d = exp
+                                    if exp_d is not None:
+                                        patch["dte"] = (exp_d - _date.today()).days
+                                patch["payload_version"] = 2
+                                # Persistir merge para atualizar UI
+                                await AlertQueueRepository.merge_payload(alert_id, {k: v for k, v in patch.items() if v is not None})
+                                payload.update({k: v for k, v in patch.items() if v is not None})
+                                alert["payload"] = payload
+
+                # Enriquecimento de mercado (preco/premio/greeks/moneyness)
+                try:
+                    payload = alert.get("payload") or {}
+                    ticker = (payload.get("ticker") or "").upper()
+                    side = (payload.get("side") or "").upper()
+                    strike = payload.get("strike")
+                    expiration = payload.get("expiration")
+
+                    # Calcular DTE se nao informado
+                    try:
+                        if payload.get("dte") in (None, "N/A") and expiration and isinstance(expiration, str) and len(expiration) >= 10:
+                            from datetime import date as _date
+                            exp_str = expiration[:10]
+                            dte = (_date.fromisoformat(exp_str) - _date.today()).days
+                            if dte < 0:
+                                dte = 0
+                            await AlertQueueRepository.merge_payload(alert_id, {"dte": dte})
+                            payload["dte"] = dte
+                    except Exception:
+                        pass
+
+                    # Apenas se tivermos o minimo necessario
+                    if ticker and strike and expiration and side in ("CALL", "PUT"):
+                        provider = get_market_data_provider()
+                        price_val = None
+                        try:
+                            q = await provider.get_quote(ticker)
+                            price_val = q.get("current_price")
+                        except Exception:
+                            # Fallback brapi para notificacao (nao bloqueante)
+                            try:
+                                q = await brapi_provider.get_quote(ticker)
+                                price_val = q.get("current_price")
+                            except Exception:
+                                price_val = None
+
+                        premium_val = None
+                        delta_val = payload.get("delta")
+                        try:
+                            opt_type = "call" if side == "CALL" else "put"
+                            oq = await provider.get_option_quote(ticker, float(strike), str(expiration), opt_type)
+                            premium_val = oq.get("premium")
+                            greeks = oq.get("greeks") or {}
+                            if delta_val is None and greeks.get("delta") is not None:
+                                delta_val = greeks.get("delta")
+                        except NotImplementedError:
+                            try:
+                                oq = await brapi_provider.get_option_quote(ticker, float(strike), str(expiration), opt_type)
+                                premium_val = oq.get("premium")
+                                greeks = oq.get("greeks") or {}
+                                if delta_val is None and greeks.get("delta") is not None:
+                                    delta_val = greeks.get("delta")
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+
+                        # Calcular moneyness/otm_pct se possivel
+                        mny = payload.get("moneyness")
+                        otm_pct = payload.get("otm_pct")
+                        if mny is None or otm_pct is None:
+                            try:
+                                if isinstance(price_val, (int, float)) and isinstance(strike, (int, float)):
+                                    if side == "CALL":
+                                        mny = "ITM" if price_val > strike else "OTM"
+                                        otm_pct = max((strike - float(price_val)) / float(price_val), 0.0)
+                                    else:  # PUT
+                                        mny = "ITM" if price_val < strike else "OTM"
+                                        otm_pct = max((float(price_val) - strike) / float(price_val), 0.0)
+                            except Exception:
+                                pass
+
+                        # Calcular PnL de premio (aproximado)
+                        pnl_premium = payload.get("pnl_premium")
+                        avg_premium = payload.get("avg_premium")
+                        if pnl_premium is None and isinstance(premium_val, (int, float)) and isinstance(avg_premium, (int, float)):
+                            try:
+                                pnl_premium = float(premium_val) - float(avg_premium)
+                            except Exception:
+                                pnl_premium = None
+
+                        patch2 = {}
+                        if price_val is not None:
+                            patch2["price"] = price_val
+                        if premium_val is not None:
+                            patch2["premium"] = premium_val
+                        if delta_val is not None:
+                            patch2["delta"] = float(delta_val)
+                        if mny is not None:
+                            patch2["moneyness"] = mny
+                        if otm_pct is not None:
+                            patch2["otm_pct"] = float(otm_pct)
+                        if pnl_premium is not None:
+                            patch2["pnl_premium"] = float(pnl_premium)
+
+                        if patch2:
+                            await AlertQueueRepository.merge_payload(alert_id, patch2)
+                            payload.update(patch2)
+                            alert["payload"] = payload
+                except Exception as _e:
+                    logger.warning("Falha ao enriquecer dados de mercado", alert_id=str(alert_id), error=str(_e))
+            except Exception as e:
+                logger.warning("Falha ao enriquecer payload legado", alert_id=str(alert_id), error=str(e))
 
             # Build message
             message = self._build_message(alert)
@@ -120,7 +297,7 @@ class NotificationService:
                         target=phone,
                         message=message,
                         status="success",
-                        provider_msg_id=result.get("message_id")
+                        provider_msg_id=(result.get("message_id") or result.get("id") or result.get("externalId") or result.get("messageId"))
                     )
                     return True
 
@@ -136,7 +313,7 @@ class NotificationService:
                         target=phone,
                         message=message,
                         status="success",
-                        provider_msg_id=result.get("message_id")
+                        provider_msg_id=(result.get("message_id") or result.get("id") or result.get("externalId") or result.get("messageId"))
                     )
                     return True
 
@@ -156,7 +333,7 @@ class NotificationService:
                         target=email,
                         message=message,
                         status="success",
-                        provider_msg_id=result.get("message_id")
+                        provider_msg_id=(result.get("message_id") or result.get("id") or result.get("externalId") or result.get("messageId"))
                     )
                     return True
 
@@ -208,59 +385,109 @@ class NotificationService:
 
         # Build message based on reason
         if reason == "roll_trigger":
-            return self._build_roll_trigger_message(payload)
+            return self._build_roll_trigger_message_v2(payload)
         elif reason == "expiration_warning":
-            return self._build_expiration_warning_message(payload)
+            return self._build_expiration_warning_message_v2(payload)
         elif reason == "delta_threshold":
-            return self._build_delta_threshold_message(payload)
+            return self._build_delta_threshold_message_v2(payload)
         else:
             return f"Alerta: {reason}"
 
-    def _build_roll_trigger_message(self, payload: Dict[str, Any]) -> str:
-        """Build message for roll trigger alert."""
+    # Versao V2 com texto corrigido (sem acentuacao) e formato compacto para canais externos
+    def _build_roll_trigger_message_v2(self, payload: Dict[str, Any]) -> str:
+        """Mensagem de rolagem com contexto acionavel (compacta para WhatsApp/SMS)."""
         ticker = payload.get("ticker", "N/A")
-        dte = payload.get("dte", "N/A")
-        delta = payload.get("delta", "N/A")
+        side = str(payload.get("side", "")).upper() or "N/A"
+        strike = payload.get("strike")
+        expiration = payload.get("expiration")
+        dte = payload.get("dte")
+        price = payload.get("price")
+        premium = payload.get("premium")
+        avg_premium = payload.get("avg_premium")
+        pnl_premium = payload.get("pnl_premium")
+        quantity = payload.get("quantity")
+        mny = payload.get("moneyness")
+        otm_pct = payload.get("otm_pct")
+        delta = payload.get("delta")
+        hint = payload.get("action_hint")
 
-        return (
-            f"🔄 Oportunidade de Rolagem Detectada!\n\n"
-            f"Ativo: {ticker}\n"
-            f"DTE: {dte} dias\n"
-            f"Delta: {delta}\n\n"
-            f"Acesse o sistema para ver as sugestões de rolagem."
-        )
+        # Helpers de formatacao
+        def fmt_money(v):
+            return f"R$ {float(v):.2f}" if isinstance(v, (int, float)) else "N/A"
+        def fmt_pct(v):
+            return f"{float(v)*100:.2f}%" if isinstance(v, (int, float)) else "N/A"
+        def fmt_num(v):
+            return f"{float(v):.2f}" if isinstance(v, (int, float)) else "N/A"
 
-    def _build_expiration_warning_message(self, payload: Dict[str, Any]) -> str:
-        """Build message for expiration warning."""
+        head = f"Rolagem: {ticker} {side} {fmt_num(strike)} | Venc: {expiration} (DTE {dte})"
+        line2 = f"Subjacente: {fmt_money(price)} | Premio: {fmt_money(premium)}"
+        if avg_premium is not None or pnl_premium is not None:
+            line2 += f" (media {fmt_money(avg_premium)}"
+            if pnl_premium is not None:
+                line2 += f", PnL {fmt_money(pnl_premium)}"
+            line2 += ")"
+
+        line3 = f"Status: {mny or 'N/A'}"
+        if otm_pct is not None:
+            line3 += f" ({fmt_pct(otm_pct)})"
+        if delta is not None:
+            line3 += f" | Delta: {fmt_num(delta)}"
+
+        line4 = hint or "Sugestao: rolar mantendo faixa OTM alvo (ver detalhes no app)."
+
+        return f"{head}\n{line2}\n{line3}\n{line4}"
+
+    def _build_expiration_warning_message_v2(self, payload: Dict[str, Any]) -> str:
+        """Mensagem de vencimento proximo com sugestao objetiva."""
         ticker = payload.get("ticker", "N/A")
-        days = payload.get("days_to_expiration", "N/A")
+        side = str(payload.get("side", "")).upper() or "N/A"
+        strike = payload.get("strike")
+        days = payload.get("days_to_expiration")
+        expiration = payload.get("expiration")
+        qty = payload.get("quantity")
 
-        return (
-            f"⚠️ Aviso de Vencimento Próximo\n\n"
-            f"Ativo: {ticker}\n"
-            f"Vence em: {days} dias\n\n"
-            f"Considere avaliar a necessidade de rolagem."
-        )
+        # Calcular dias ate o vencimento se nao vier no payload
+        if days in (None, "N/A") and expiration:
+            try:
+                from datetime import date as _date
+                exp_str = expiration[:10] if isinstance(expiration, str) else None
+                if exp_str:
+                    dte = (_date.fromisoformat(exp_str) - _date.today()).days
+                    days = max(dte, 0)
+            except Exception:
+                days = "N/A"
 
-    def _build_delta_threshold_message(self, payload: Dict[str, Any]) -> str:
-        """Build message for delta threshold alert."""
+        def fmt_num(v):
+            return f"{float(v):.2f}" if isinstance(v, (int, float)) else "N/A"
+
+        days_display = days if isinstance(days, int) else "N/A"
+        unit = "dia" if days_display == 1 else "dias"
+        parts = [ticker]
+        if side and side != "N/A":
+            parts.append(side)
+        if isinstance(strike, (int, float)):
+            parts.append(fmt_num(strike))
+        asset_str = " ".join(parts)
+        head = f"Aviso: Vencimento em {days_display} {unit}: {asset_str}"
+        line2 = f"Venc: {expiration} | Qtd: {qty or 'N/A'}"
+        line3 = "Sugestao: avaliar rolagem hoje para evitar exercicio indesejado."
+        return f"{head}\n{line2}\n{line3}"
+
+    def _build_delta_threshold_message_v2(self, payload: Dict[str, Any]) -> str:
+        """Mensagem de delta com contexto do strike."""
         ticker = payload.get("ticker", "N/A")
-        delta = payload.get("delta", "N/A")
-        threshold = payload.get("threshold", "N/A")
+        side = str(payload.get("side", "")).upper() or "N/A"
+        strike = payload.get("strike")
+        delta = payload.get("delta")
+        threshold = payload.get("threshold")
 
-        # Format numbers with 2 decimal places if they are floats
-        if isinstance(delta, (int, float)):
-            delta = f"{delta:.2f}"
-        if isinstance(threshold, (int, float)):
-            threshold = f"{threshold:.2f}"
+        def fmt_num(v):
+            return f"{float(v):.2f}" if isinstance(v, (int, float)) else "N/A"
 
-        return (
-            f"📊 Threshold de Delta Atingido\n\n"
-            f"Ativo: {ticker}\n"
-            f"Delta Atual: {delta}\n"
-            f"Threshold: {threshold}\n\n"
-            f"A opção está se aproximando do strike."
-        )
+        head = "Delta atingiu limite"
+        line2 = f"{ticker} {side} {fmt_num(strike)} | Delta: {fmt_num(delta)} (limite {fmt_num(threshold)})"
+        line3 = "A opcao esta se aproximando do strike (risco de exercicio)."
+        return f"{head}\n{line2}\n{line3}"
 
     async def process_pending_alerts(self, limit: int = 100) -> Dict[str, int]:
         """

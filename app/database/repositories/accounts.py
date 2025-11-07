@@ -25,6 +25,8 @@ def _serialize_account_row(row: asyncpg.Record) -> Dict[str, Any]:
         "name": get_field("name"),
         "broker": get_field("broker"),
         "account_number": get_field("account_number"),
+        "phone": get_field("phone"),
+        "email": get_field("email"),
         "created_at": (created.isoformat() + "Z") if created else None,
     }
 
@@ -54,7 +56,7 @@ class AccountsRepository(BaseRepository):
             try:
                 rows = await conn.fetch(
                     f"""
-                    SELECT id, user_id, name, broker, account_number, created_at
+                    SELECT id, user_id, name, broker, account_number, phone, email, created_at
                     FROM {settings.DB_SCHEMA}.accounts
                     ORDER BY created_at DESC
                     """
@@ -66,7 +68,7 @@ class AccountsRepository(BaseRepository):
             # Fallback to Supabase service client if direct PG connection fails (e.g., DNS)
             logger.warning("AccountsRepository.get_all fallback to Supabase", error=str(e))
             result = supabase.table(cls.table_name) \
-                .select("id,user_id,name,broker,account_number,created_at") \
+                .select("id,user_id,name,broker,account_number,phone,email,created_at") \
                 .order("created_at") \
                 .execute()
             return result.data or []
@@ -86,7 +88,7 @@ class AccountsRepository(BaseRepository):
         try:
             rows = await conn.fetch(
                 f"""
-                SELECT id, user_id, name, broker, account_number, created_at
+                SELECT id, user_id, name, broker, account_number, phone, email, created_at
                 FROM {settings.DB_SCHEMA}.accounts
                 WHERE user_id = $1
                 ORDER BY created_at DESC
@@ -105,14 +107,16 @@ class AccountsRepository(BaseRepository):
         try:
             row = await conn.fetchrow(
                 f"""
-                INSERT INTO {settings.DB_SCHEMA}.accounts (user_id, name, broker, account_number)
-                VALUES ($1, $2, $3, $4)
-                RETURNING id, user_id, name, broker, account_number, created_at
+                INSERT INTO {settings.DB_SCHEMA}.accounts (user_id, name, broker, account_number, phone, email)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id, user_id, name, broker, account_number, phone, email, created_at
                 """,
                 str(data.get("user_id")),
                 data.get("name"),
                 data.get("broker"),
                 data.get("account_number"),
+                data.get("phone"),
+                data.get("email"),
             )
             return _serialize_account_row(row)
         finally:
@@ -125,7 +129,7 @@ class AccountsRepository(BaseRepository):
         try:
             row = await conn.fetchrow(
                 f"""
-                SELECT id, user_id, name, broker, account_number, created_at
+                SELECT id, user_id, name, broker, account_number, phone, email, created_at
                 FROM {settings.DB_SCHEMA}.accounts
                 WHERE id = $1
                 """,
@@ -149,6 +153,12 @@ class AccountsRepository(BaseRepository):
         if "account_number" in data:
             fields.append("account_number")
             values.append(data.get("account_number"))
+        if "phone" in data:
+            fields.append("phone")
+            values.append(data.get("phone"))
+        if "email" in data:
+            fields.append("email")
+            values.append(data.get("email"))
         if not fields:
             # Nothing to update; return current record
             existing = await cls.get_by_id(id, auth_user_id=auth_user_id)
@@ -165,7 +175,7 @@ class AccountsRepository(BaseRepository):
                 UPDATE {settings.DB_SCHEMA}.accounts
                 SET {set_clause}
                 WHERE id = $1
-                RETURNING id, user_id, name, broker, account_number, created_at
+                RETURNING id, user_id, name, broker, account_number, phone, email, created_at
                 """,
                 str(id),
                 *values,

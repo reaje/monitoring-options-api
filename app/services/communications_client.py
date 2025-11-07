@@ -11,15 +11,68 @@ class CommunicationsAPIClient:
 
     def __init__(self):
         """Initialize communications client."""
-        self.base_url = settings.COMM_API_URL
-        self.api_key = settings.COMM_API_KEY
+        self.base_url = settings.COMM_API_URL.rstrip("/")
+        self.api_key = (settings.COMM_API_KEY or "").strip()
+        self.client_id = getattr(settings, "COMM_CLIENT_ID", None)
+        self.email = getattr(settings, "COMM_EMAIL", None)
+        self.password = getattr(settings, "COMM_PASSWORD", None)
         self.timeout = 30.0
+        self._auth_token: Optional[str] = self.api_key or None  # Prefer API key if provided
 
-        # Default headers
-        self.headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
+    def _headers(self) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self._auth_token:
+            headers["Authorization"] = f"Bearer {self._auth_token}"
+        return headers
+
+    @staticmethod
+    def _normalize_phone(phone: str) -> str:
+        """Normalize E.164 to only digits as required by CommunicationsAPI schemas (10-15 digits)."""
+        return "".join(ch for ch in str(phone) if ch.isdigit())
+
+    async def _login(self) -> None:
+        """Authenticate against Communications API to obtain JWT when API key is not provided."""
+        # If API key configured, skip login
+        if self.api_key:
+            self._auth_token = self.api_key
+            return
+        # Try client-login first (tenant-aware)
+        login_payload_variants: List[Dict[str, Any]] = []
+        if self.client_id and self.email and self.password:
+            login_payload_variants.append({
+                "clientId": self.client_id,
+                "email": self.email,
+                "password": self.password,
+            })
+        # Fallback to simple login without clientId
+        if self.email and self.password:
+            login_payload_variants.append({
+                "email": self.email,
+                "password": self.password,
+            })
+        if not login_payload_variants:
+            logger.warning("CommunicationsAPI login skipped: missing credentials")
+            self._auth_token = None
+            return
+        # Endpoints as per OpenAPI
+        endpoints = [f"{self.base_url}/api/v1/Auth/client-login", f"{self.base_url}/api/v1/Auth/login"]
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            for ep in endpoints:
+                for payload in login_payload_variants:
+                    try:
+                        resp = await client.post(ep, json=payload, headers={"Content-Type": "application/json"})
+                        if resp.status_code >= 400:
+                            continue
+                        data = resp.json()
+                        token = data.get("access_token") or data.get("accessToken") or data.get("token") or data.get("jwt")
+                        if token:
+                            self._auth_token = token
+                            logger.info("CommunicationsAPI auth success", endpoint=ep)
+                            return
+                    except Exception as e:
+                        logger.warning("CommunicationsAPI auth attempt failed", endpoint=ep, error=str(e))
+        logger.warning("CommunicationsAPI auth failed: no token obtained")
+        self._auth_token = None
 
     async def send_whatsapp(
         self,
@@ -43,45 +96,46 @@ class CommunicationsAPIClient:
         Raises:
             httpx.HTTPError: On communication errors
         """
-        endpoint = f"{self.base_url}/whatsapp/send"
-
-        payload = {
-            "phone": phone,
-            "message": message,
-        }
-
+        # Prefer Notification endpoint; fallback to generic Message endpoint
+        norm = self._normalize_phone(phone)
+        primary_payload = {"to": norm, "message": message}
         if template:
-            payload["template"] = template
-            payload["params"] = params or {}
+            meta: Dict[str, Any] = {"template": template}
+            if params:
+                meta.update(params)
+            primary_payload["metadata"] = meta
+        fallback_payload = {"to": norm, "content": message}
+        endpoints = [
+            (f"{self.base_url}/api/v1/Notification/whatsapp", primary_payload),
+            (f"{self.base_url}/api/v1/Message/text", fallback_payload),
+        ]
 
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(
-                    endpoint,
-                    json=payload,
-                    headers=self.headers
-                )
-                response.raise_for_status()
-
-                result = response.json()
-
-                logger.info(
-                    "WhatsApp message sent",
-                    phone=phone,
-                    message_id=result.get("message_id"),
-                    status=result.get("status")
-                )
-
-                return result
-
-        except httpx.HTTPError as e:
-            logger.error(
-                "Failed to send WhatsApp message",
-                phone=phone,
-                error=str(e),
-                status_code=getattr(e.response, "status_code", None) if hasattr(e, "response") else None
-            )
-            raise
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            # Ensure auth token
+            if not self._auth_token:
+                await self._login()
+            last_exc: Optional[Exception] = None
+            for ep, payload in endpoints:
+                for attempt in range(2):  # try once, on 401 re-login and retry
+                    try:
+                        resp = await client.post(ep, json=payload, headers=self._headers())
+                        if resp.status_code == 401 and attempt == 0:
+                            await self._login()
+                            continue
+                        resp.raise_for_status()
+                        result = resp.json()
+                        logger.debug("WhatsApp API response", endpoint=ep, response=result)
+                        logger.info("WhatsApp message sent", phone=phone, endpoint=ep, status=result.get("status"), provider_msg_id=(result.get("message_id") or result.get("id") or result.get("externalId") or result.get("messageId")))
+                        return result
+                    except httpx.HTTPError as e:
+                        last_exc = e
+                        # Try next variant on 400/404/415
+                        if getattr(e, "response", None) and e.response is not None and e.response.status_code in (400, 404, 415):
+                            break
+            logger.error("Failed to send WhatsApp message", phone=phone, error=str(last_exc) if last_exc else "unknown")
+            if last_exc:
+                raise last_exc
+            raise RuntimeError("Unknown error sending WhatsApp message")
 
     async def send_sms(
         self,
@@ -101,41 +155,35 @@ class CommunicationsAPIClient:
         Raises:
             httpx.HTTPError: On communication errors
         """
-        endpoint = f"{self.base_url}/sms/send"
-
-        payload = {
-            "phone": phone,
-            "message": message,
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(
-                    endpoint,
-                    json=payload,
-                    headers=self.headers
-                )
-                response.raise_for_status()
-
-                result = response.json()
-
-                logger.info(
-                    "SMS sent",
-                    phone=phone,
-                    message_id=result.get("message_id"),
-                    status=result.get("status")
-                )
-
-                return result
-
-        except httpx.HTTPError as e:
-            logger.error(
-                "Failed to send SMS",
-                phone=phone,
-                error=str(e),
-                status_code=getattr(e.response, "status_code", None) if hasattr(e, "response") else None
-            )
-            raise
+        norm = self._normalize_phone(phone)
+        endpoints = [
+            (f"{self.base_url}/api/v1/Notification/sms", {"to": norm, "message": message}),
+            (f"{self.base_url}/api/v1/Message/text", {"to": norm, "content": message}),
+        ]
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            if not self._auth_token:
+                await self._login()
+            last_exc: Optional[Exception] = None
+            for ep, payload in endpoints:
+                for attempt in range(2):
+                    try:
+                        resp = await client.post(ep, json=payload, headers=self._headers())
+                        if resp.status_code == 401 and attempt == 0:
+                            await self._login()
+                            continue
+                        resp.raise_for_status()
+                        result = resp.json()
+                        logger.debug("SMS API response", endpoint=ep, response=result)
+                        logger.info("SMS sent", phone=phone, endpoint=ep, status=result.get("status"), provider_msg_id=(result.get("message_id") or result.get("id") or result.get("externalId") or result.get("messageId")))
+                        return result
+                    except httpx.HTTPError as e:
+                        last_exc = e
+                        if getattr(e, "response", None) and e.response is not None and e.response.status_code in (400, 404, 415):
+                            break
+            logger.error("Failed to send SMS", phone=phone, error=str(last_exc) if last_exc else "unknown")
+            if last_exc:
+                raise last_exc
+            raise RuntimeError("Unknown error sending SMS")
 
     async def send_email(
         self,
@@ -159,45 +207,37 @@ class CommunicationsAPIClient:
         Raises:
             httpx.HTTPError: On communication errors
         """
-        endpoint = f"{self.base_url}/email/send"
-
-        payload = {
-            "email": email,
-            "subject": subject,
-            "message": message,
-        }
-
-        if html:
-            payload["html"] = html
-
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(
-                    endpoint,
-                    json=payload,
-                    headers=self.headers
-                )
-                response.raise_for_status()
-
-                result = response.json()
-
-                logger.info(
-                    "Email sent",
-                    email=email,
-                    message_id=result.get("message_id"),
-                    status=result.get("status")
-                )
-
-                return result
-
-        except httpx.HTTPError as e:
-            logger.error(
-                "Failed to send email",
-                email=email,
-                error=str(e),
-                status_code=getattr(e.response, "status_code", None) if hasattr(e, "response") else None
-            )
-            raise
+        html_body = html if html is not None else message
+        payload = {"to": email, "subject": subject, "htmlContent": html_body}
+        if message and html_body != message:
+            payload["textContent"] = message
+        endpoints = [
+            (f"{self.base_url}/api/v1/Notification/email", payload),
+        ]
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            if not self._auth_token:
+                await self._login()
+            last_exc: Optional[Exception] = None
+            for ep, payload in endpoints:
+                for attempt in range(2):
+                    try:
+                        resp = await client.post(ep, json=payload, headers=self._headers())
+                        if resp.status_code == 401 and attempt == 0:
+                            await self._login()
+                            continue
+                        resp.raise_for_status()
+                        result = resp.json()
+                        logger.debug("Email API response", endpoint=ep, response=result)
+                        logger.info("Email sent", email=email, endpoint=ep, status=result.get("status"), provider_msg_id=(result.get("message_id") or result.get("id") or result.get("externalId") or result.get("messageId")))
+                        return result
+                    except httpx.HTTPError as e:
+                        last_exc = e
+                        if getattr(e, "response", None) and e.response is not None and e.response.status_code in (400, 404, 415):
+                            break
+            logger.error("Failed to send email", email=email, error=str(last_exc) if last_exc else "unknown")
+            if last_exc:
+                raise last_exc
+            raise RuntimeError("Unknown error sending email")
 
     async def get_message_status(
         self,
@@ -215,25 +255,32 @@ class CommunicationsAPIClient:
         Raises:
             httpx.HTTPError: On communication errors
         """
-        endpoint = f"{self.base_url}/messages/{message_id}/status"
-
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.get(
-                    endpoint,
-                    headers=self.headers
-                )
-                response.raise_for_status()
-
-                return response.json()
-
-        except httpx.HTTPError as e:
-            logger.error(
-                "Failed to get message status",
-                message_id=message_id,
-                error=str(e)
-            )
-            raise
+        # Try Notification then Message status endpoints
+        endpoints = [
+            f"{self.base_url}/api/v1/Notification/{message_id}",
+            f"{self.base_url}/api/v1/Message/{message_id}/status",
+        ]
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            if not self._auth_token:
+                await self._login()
+            last_exc: Optional[Exception] = None
+            for ep in endpoints:
+                for attempt in range(2):
+                    try:
+                        resp = await client.get(ep, headers=self._headers())
+                        if resp.status_code == 401 and attempt == 0:
+                            await self._login()
+                            continue
+                        resp.raise_for_status()
+                        return resp.json()
+                    except httpx.HTTPError as e:
+                        last_exc = e
+                        if getattr(e, "response", None) and e.response is not None and e.response.status_code in (400, 404, 415):
+                            break
+            logger.error("Failed to get message status", message_id=message_id, error=str(last_exc) if last_exc else "unknown")
+            if last_exc:
+                raise last_exc
+            raise RuntimeError("Unknown error getting message status")
 
     async def send_bulk_whatsapp(
         self,
@@ -262,7 +309,7 @@ class CommunicationsAPIClient:
                 response = await client.post(
                     endpoint,
                     json=payload,
-                    headers=self.headers
+                    headers=self._headers()
                 )
                 response.raise_for_status()
 

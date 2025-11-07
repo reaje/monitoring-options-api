@@ -224,16 +224,30 @@ class MonitorWorker:
                     return False  # Already alerted today
 
             # Create expiration warning alert
+            # Derivar ticker via asset para enriquecer payload
+            ticker = position.get("ticker")
+            try:
+                asset_id = position.get("asset_id")
+                if asset_id and not ticker:
+                    from uuid import UUID as _UUID
+                    asset = await AssetsRepository.get_by_id(_UUID(str(asset_id)))
+                    if asset:
+                        ticker = asset.get("ticker")
+            except Exception:
+                pass
+
             alert_data = {
                 "account_id": str(account_id),
                 "option_position_id": position["id"],
                 "reason": "expiration_warning",
                 "payload": {
-                    "ticker": position.get("ticker", "N/A"),
+                    "ticker": ticker or "N/A",
                     "days_to_expiration": dte,
                     "expiration": str(expiration),
                     "strike": float(position.get("strike", 0)),
-                    "side": position.get("side")
+                    "side": position.get("side"),
+                    "quantity": position.get("quantity"),
+                    "channels": ["whatsapp", "sms"],
                 },
                 "status": "PENDING"
             }
@@ -322,6 +336,75 @@ class MonitorWorker:
 
         if is_triggered:
             # Check if we already created an alert for this rule+position today
+            # Build enriched payload (v2) upfront
+            dte_val = self._calculate_dte(position.get("expiration"))
+            strike_val = float(position.get("strike", 0))
+            side_val = position.get("side")
+            moneyness = None
+            otm_pct = None
+            pnl_premium = None
+
+            if current_price is not None and strike_val:
+                if str(side_val).upper() == "CALL":
+                    moneyness = "ITM" if current_price > strike_val else "OTM"
+                    otm_pct = max(0.0, (strike_val - current_price) / current_price)
+                elif str(side_val).upper() == "PUT":
+                    moneyness = "ITM" if current_price < strike_val else "OTM"
+                    otm_pct = max(0.0, (current_price - strike_val) / current_price)
+
+            if position.get("avg_premium") is not None and current_premium is not None:
+                try:
+                    pnl_premium = float(position.get("avg_premium")) - float(current_premium)
+                except Exception:
+                    pnl_premium = None
+
+            # Normalizar canais de notificacao da regra (pode vir como string JSON ou texto)
+            try:
+                _rule_channels = rule.get("notify_channels") or []
+                if isinstance(_rule_channels, str):
+                    import json as _json
+                    try:
+                        parsed = _json.loads(_rule_channels)
+                        _rule_channels = parsed if isinstance(parsed, list) else [_rule_channels]
+                    except Exception:
+                        _rule_channels = [_rule_channels]
+                elif not isinstance(_rule_channels, list):
+                    _rule_channels = []
+                channels = list(dict.fromkeys(_rule_channels + ["whatsapp", "sms"]))
+            except Exception:
+                channels = ["whatsapp", "sms"]
+
+            new_payload = {
+                "rule_id": rule["id"],
+                "ticker": ticker or position.get("ticker", "N/A"),
+                "strike": strike_val,
+                "expiration": str(position.get("expiration")),
+                "side": side_val,
+                "delta": current_delta,
+                "price": current_price,
+                "premium": current_premium,
+                "dte": dte_val,
+                "quantity": position.get("quantity"),
+                "avg_premium": position.get("avg_premium"),
+                "moneyness": moneyness,
+                "otm_pct": otm_pct,
+                "pnl_premium": pnl_premium,
+                "channels": channels,
+                "payload_version": 2,
+            }
+
+            # Simple action hint based on OTM target range
+            try:
+                target_low = (rule.get("target_otm_pct_low") or 0.03)
+                target_high = (rule.get("target_otm_pct_high") or 0.08)
+                if otm_pct is not None:
+                    if otm_pct < target_low:
+                        new_payload["action_hint"] = "Sugerido: rolar para strike mais OTM dentro da faixa alvo."
+                    elif otm_pct > target_high:
+                        new_payload["action_hint"] = "Sugerido: avaliar strike mais próximo para aumentar prêmio."
+            except Exception:
+                pass
+
             today = date.today().isoformat()
             existing_alerts = await AlertQueueRepository.get_by_account_id(
                 account_id,
@@ -337,36 +420,48 @@ class MonitorWorker:
                         alert = _json.loads(alert)
                     except Exception:
                         continue
-                payload = alert.get("payload", {})
-                if isinstance(payload, str):
+                dup_payload = alert.get("payload", {})
+                if isinstance(dup_payload, str):
                     try:
                         import json as _json
-                        payload = _json.loads(payload)
+                        dup_payload = _json.loads(dup_payload)
                     except Exception:
-                        payload = {}
-                if (alert.get("option_position_id") == position["id"] and
-                    alert.get("reason") == "roll_trigger" and
-                    payload.get("rule_id") == rule["id"] and
-                    alert.get("created_at", "").startswith(today)):
-                    return False  # Already alerted today
+                        dup_payload = {}
+                if (
+                    alert.get("option_position_id") == position["id"]
+                    and alert.get("reason") == "roll_trigger"
+                    and dup_payload.get("rule_id") == rule["id"]
+                    and alert.get("created_at", "").startswith(today)
+                ):
+                    # If existing alert for today lacks enriched fields, merge them instead of creating another
+                    def _is_missing(v):
+                        return v is None or (isinstance(v, str) and (v.strip() == "" or v.strip().upper() == "N/A"))
+                    missing_core = any(
+                        _is_missing(dup_payload.get(k)) for k in ["ticker", "side", "strike", "expiration", "dte"]
+                    )
+                    if missing_core:
+                        try:
+                            patch = dict(new_payload)
+                            patch["payload_version"] = 2
+                            from uuid import UUID as _UUID
+                            await AlertQueueRepository.merge_payload(_UUID(str(alert["id"])), patch, auth_user_id=user_id)
+                            logger.info(
+                                "Merged enriched payload into existing alert",
+                                alert_id=str(alert.get("id")),
+                                rule_id=rule["id"],
+                            )
+                        except Exception as me:
+                            logger.warning("Failed to merge enriched payload", error=str(me))
+                        return False  # Do not create a new one
+                    return False  # Already alerted today with sufficient data
 
-            # Create roll trigger alert
+            # Create roll trigger alert with enriched payload
             alert_data = {
                 "account_id": str(account_id),
                 "option_position_id": position["id"],
                 "reason": "roll_trigger",
-                "payload": {
-                    "rule_id": rule["id"],
-                    "ticker": ticker or position.get("ticker", "N/A"),
-                    "strike": float(position.get("strike", 0)),
-                    "expiration": str(position.get("expiration")),
-                    "side": position.get("side"),
-                    "delta": current_delta,
-                    "price": current_price,
-                    "premium": current_premium,
-                    "dte": self._calculate_dte(position.get("expiration"))
-                },
-                "status": "PENDING"
+                "payload": new_payload,
+                "status": "PENDING",
             }
 
             await AlertQueueRepository.create(alert_data, auth_user_id=user_id)

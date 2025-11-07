@@ -243,7 +243,7 @@ async def get_alert(request: Request, alert_id: str):
     """
     user = request.ctx.user
     user_id = UUID(user["id"])
-    alert_uuid = UUID(alert_id)
+    alert_uuid = alert_id if isinstance(alert_id, UUID) else UUID(str(alert_id))
 
     # Get alert with ownership check
     alert = await AlertQueueRepository.get_user_alert(alert_uuid, user_id)
@@ -286,7 +286,7 @@ async def delete_alert(request: Request, alert_id: str):
     """
     user = request.ctx.user
     user_id = UUID(user["id"])
-    alert_uuid = UUID(alert_id)
+    alert_uuid = alert_id if isinstance(alert_id, UUID) else UUID(str(alert_id))
 
     # Check ownership
     existing = await AlertQueueRepository.get_user_alert(alert_uuid, user_id)
@@ -331,7 +331,7 @@ async def retry_alert(request: Request, alert_id: str):
     """
     user = request.ctx.user
     user_id = UUID(user["id"])
-    alert_uuid = UUID(alert_id)
+    alert_uuid = alert_id if isinstance(alert_id, UUID) else UUID(str(alert_id))
 
     # Check ownership
     existing = await AlertQueueRepository.get_user_alert(alert_uuid, user_id)
@@ -381,7 +381,7 @@ async def get_alert_statistics(request: Request, account_id: str):
     """
     user = request.ctx.user
     user_id = UUID(user["id"])
-    account_uuid = UUID(account_id)
+    account_uuid = account_id if isinstance(account_id, UUID) else UUID(str(account_id))
 
     # Check ownership
     if not await AccountsRepository.user_owns_account(account_uuid, user_id):
@@ -422,7 +422,7 @@ async def get_alert_logs(request: Request, alert_id: str):
     """
     user = request.ctx.user
     user_id = UUID(user["id"])
-    alert_uuid = UUID(alert_id)
+    alert_uuid = alert_id if isinstance(alert_id, UUID) else UUID(str(alert_id))
 
     # Check ownership
     existing = await AlertQueueRepository.get_user_alert(alert_uuid, user_id)

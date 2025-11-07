@@ -89,6 +89,8 @@ async def create_account(request: Request):
             "user_id": str(user_id),
             "broker": data.get("broker"),
             "account_number": data.get("account_number"),
+            "phone": data.get("phone"),
+            "email": data.get("email"),
         }
 
         # Validate with Pydantic

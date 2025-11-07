@@ -26,12 +26,27 @@ def _serialize_alert_row(row: asyncpg.Record) -> Dict[str, Any]:
         return row.get(key) if is_dict else row[key] if key in row.keys() else None
 
     def _fmt_created(dt: datetime) -> Optional[str]:
-        if not dt:
+        """Formata created_at para RFC3339. Robusto a tipos inesperados.
+        Em alguns cenrios (p.ex. JOINs/ALIAS incorretos ou drivers retornando
+        tipos incomuns), `dt` pode vir como str/UUID; neste caso, apenas devolvemos
+        `str(dt)` ou None sem tentar acessar mtodos de datetime.
+        """
+        if dt is None:
             return None
+        # Se j for string, apenas retorne
+        if isinstance(dt, str):
+            return dt
+        # Evitar falhas quando vier um UUID/objeto no-datetime
+        from datetime import datetime as _dt
+        if not isinstance(dt, _dt):
+            try:
+                return str(dt)
+            except Exception:
+                return None
         try:
-            # Ensure RFC3339 with trailing 'Z' and no '+00:00Z'
+            # Garantir RFC3339 com 'Z' no fim e sem '+00:00Z'
             if getattr(dt, "tzinfo", None) is None or dt.tzinfo.utcoffset(dt) is None:
-                # Treat naive as UTC
+                # Tratar naive como UTC
                 return dt.replace(tzinfo=_tz.utc).isoformat().replace("+00:00", "Z")
             return dt.astimezone(_tz.utc).isoformat().replace("+00:00", "Z")
         except Exception:
@@ -159,6 +174,36 @@ class AlertQueueRepository(BaseRepository):
         finally:
             await conn.close()
 
+    @classmethod
+    async def merge_payload(
+        cls,
+        alert_id: UUID,
+        patch: Dict[str, Any],
+        *,
+        auth_user_id: Optional[UUID] = None,
+    ) -> Dict[str, Any]:
+        """Merge a JSON patch into the alert payload (jsonb concatenation).
+
+        If auth_user_id is provided, uses direct PG (RLS-aware). This updates only
+        the payload field, preserving current status.
+        """
+        import json as _json
+        conn = await cls._get_conn(auth_user_id=str(auth_user_id) if auth_user_id else None)
+        try:
+            row = await conn.fetchrow(
+                f"UPDATE {settings.DB_SCHEMA}.alert_queue "
+                f"SET payload = COALESCE(payload, '{{}}'::jsonb) || $2::jsonb "
+                f"WHERE id = $1 "
+                f"RETURNING id, account_id, option_position_id, reason, payload, status, created_at",
+                str(alert_id), _json.dumps(patch),
+            )
+            if not row:
+                raise NotFoundError(cls.table_name, alert_id)
+            return _serialize_alert_row(row)
+        finally:
+            await conn.close()
+
+
 
     @classmethod
     async def get_pending_alerts(
@@ -187,14 +232,18 @@ class AlertQueueRepository(BaseRepository):
             finally:
                 await conn.close()
         else:
-            # Fallback to Supabase service client for worker global visibility
-            result = supabase.table(cls.table_name) \
-                .select("*") \
-                .eq("status", "PENDING") \
-                .order("created_at") \
-                .limit(limit) \
-                .execute()
-            return result.data
+            # Global worker path: usar conexao direta (service role) e ignorar RLS
+            conn = await cls._get_conn()
+            try:
+                rows = await conn.fetch(
+                    f"SELECT id, account_id, option_position_id, reason, payload, status, created_at "
+                    f"FROM {settings.DB_SCHEMA}.alert_queue "
+                    f"WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT $1",
+                    limit or 100,
+                )
+                return [_serialize_alert_row(r) for r in rows]
+            finally:
+                await conn.close()
 
     @classmethod
     async def get_failed_alerts(
@@ -292,26 +341,40 @@ class AlertQueueRepository(BaseRepository):
             finally:
                 await conn.close()
         else:
-            update_data: Dict[str, Any] = {"status": status}
+            # Atualizacao global (worker): usar conexao direta ao Postgres (service role)
+            import json as _json
+            payload = None
             if error_message:
-                # Fetch existing via asyncpg (no auth) just to merge payload; if RLS blocks it,
-                # we skip merging and let the update proceed with status only via Supabase.
                 try:
                     existing = await cls.get_by_id(alert_id)
                     if existing:
                         payload = existing.get("payload", {}) or {}
                         payload["error"] = error_message
-                        update_data["payload"] = payload
                 except Exception:
-                    pass
-            # Fallback to Supabase update
-            result = supabase.table(cls.table_name) \
-                .update(update_data) \
-                .eq("id", str(alert_id)) \
-                .execute()
-            if not result.data:
-                raise DatabaseError("Failed to update alert status")
-            return result.data[0]
+                    payload = None
+            conn = await cls._get_conn()
+            try:
+                if payload is not None:
+                    row = await conn.fetchrow(
+                        f"UPDATE {settings.DB_SCHEMA}.alert_queue "
+                        f"SET status = $2, payload = $3::jsonb "
+                        f"WHERE id = $1 "
+                        f"RETURNING id, account_id, option_position_id, reason, payload, status, created_at",
+                        str(alert_id), status, _json.dumps(payload),
+                    )
+                else:
+                    row = await conn.fetchrow(
+                        f"UPDATE {settings.DB_SCHEMA}.alert_queue "
+                        f"SET status = $2 "
+                        f"WHERE id = $1 "
+                        f"RETURNING id, account_id, option_position_id, reason, payload, status, created_at",
+                        str(alert_id), status,
+                    )
+                if not row:
+                    raise DatabaseError("Failed to update alert status")
+                return _serialize_alert_row(row)
+            finally:
+                await conn.close()
 
     @classmethod
     async def mark_as_processing(

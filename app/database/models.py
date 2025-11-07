@@ -94,6 +94,8 @@ class AccountBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     broker: Optional[str] = Field(None, max_length=100)
     account_number: Optional[str] = Field(None, max_length=100)
+    phone: Optional[str] = Field(None, min_length=8, max_length=20)
+    email: Optional[EmailStr] = None
 
 
 class AccountCreate(AccountBase):
@@ -108,6 +110,8 @@ class AccountUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=100)
     broker: Optional[str] = Field(None, max_length=100)
     account_number: Optional[str] = Field(None, max_length=100)
+    phone: Optional[str] = Field(None, min_length=8, max_length=20)
+    email: Optional[EmailStr] = None
 
 
 class Account(AccountBase):
