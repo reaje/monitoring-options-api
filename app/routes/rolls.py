@@ -391,3 +391,61 @@ async def execute_roll_mt5(request: Request):
     logger.info("rolls.mt5.enqueue", command_id=saved["id"], terminal_id=terminal_id, position_id=str(position_id))
 
     return response.json({"command": saved}, status=201)
+
+
+@rolls_bp.get("/mt5/command/<command_id>")
+@openapi.tag("Rolls")
+@openapi.summary("Obter status de execucao MT5 enfileirada (apenas do proprio usuario)")
+@openapi.secured("BearerAuth")
+@require_auth
+async def get_roll_mt5_command_status(request: Request, command_id: str):
+    from uuid import UUID as _UUID
+    try:
+        user = request.ctx.user
+        user_id = _UUID(user["id"])  # valida UUID
+    except Exception:
+        return response.json({"error": "unauthorized"}, status=401)
+
+    try:
+        from MT5.storage import get_command_by_id as _get_cmd
+    except Exception as e:
+        return response.json({"error": "bridge_not_available", "details": str(e)}, status=503)
+
+    cmd = _get_cmd(command_id)
+    if not cmd:
+        return response.json({"error": "not_found"}, status=404)
+
+    if str(cmd.get("created_by") or "") != str(user_id):
+        # Nao revelar existencia de comandos de outros usuarios
+        return response.json({"error": "not_found"}, status=404)
+
+    # Opcional: esconder campos internos
+    sanitized = dict(cmd)
+    return response.json({"command": sanitized}, status=200)
+
+
+@rolls_bp.get("/mt5/commands")
+@openapi.tag("Rolls")
+@openapi.summary("Listar comandos MT5 do usuario autenticado (mais recentes primeiro)")
+@openapi.secured("BearerAuth")
+@require_auth
+async def list_roll_mt5_commands(request: Request):
+    try:
+        from MT5.storage import list_commands as _list_cmds
+    except Exception as e:
+        return response.json({"error": "bridge_not_available", "details": str(e)}, status=503)
+
+    user = request.ctx.user
+    user_id = str(user.get("id") or "").strip()
+    if not user_id:
+        return response.json({"error": "unauthorized"}, status=401)
+
+    try:
+        limit = int(request.args.get("limit", 50))
+    except Exception:
+        limit = 50
+
+    cmds = _list_cmds(created_by=user_id, limit=limit)
+    return response.json({"commands": cmds, "count": len(cmds)}, status=200)
+
+

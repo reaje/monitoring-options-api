@@ -17,7 +17,7 @@
 
 //--- Inputs configuráveis
 //=== Configurações do Servidor ===
-input string    InpBackendUrl = "http://localhost:8000";     // URL do Backend (sem / no final)
+input string    InpBackendUrl = "http://127.0.0.1:8000";     // URL do Backend (sem / no final)
 input string    InpAuthToken = "";                            // Bearer Token para autenticação
 
 //=== Identificação do Terminal ===
@@ -36,6 +36,11 @@ input int       InpCommandsPollInterval = 10;                 // Intervalo de po
 //=== Configurações Avançadas ===
 input bool      InpEnableLogging = true;                      // Habilitar logs detalhados
 input int       InpHttpTimeout = 5000;                        // Timeout HTTP em ms (5000ms)
+
+
+//=== Descoberta automática de símbolos de opções ===
+input bool      InpAutoDiscoverOptionSymbols = true;           // Tentar descobrir símbolos de opções no MarketWatch
+input int       InpMaxAutoOptionSymbols = 200;                  // Limite máximo ao auto-descobrir (evitar listas enormes)
 
 //--- Variáveis globais
 CHttpClient*    g_http_client = NULL;
@@ -107,6 +112,25 @@ int OnInit()
             {
                 Print("  - ", g_option_symbols[i]);
             }
+        }
+    }
+
+
+    // Auto-descoberta de símbolos de opções, se não houver lista explícita
+    if(g_option_symbols_count == 0 && InpAutoDiscoverOptionSymbols)
+    {
+        if(AutoDiscoverOptionSymbols())
+        {
+            Print("Opções auto-descobertas: ", g_option_symbols_count);
+            int show = MathMin(g_option_symbols_count, 20);
+            for(int i = 0; i < show; i++)
+                Print("  - ", g_option_symbols[i]);
+            if(g_option_symbols_count > show)
+                Print("  ... (", g_option_symbols_count - show, " restantes)");
+        }
+        else
+        {
+            Print("AVISO: Não foi possível auto-descobrir símbolos de opções (MarketWatch vazio ou sem padrões reconhecidos)");
         }
     }
 
@@ -411,7 +435,7 @@ void PollCommands()
         return;
     }
 
-    // Verificar se h e1 comandos
+    // Verificar se há comandos
     if(CJsonHelper::HasEmptyArray(response, "commands"))
     {
         // Sem comandos pendentes
@@ -424,7 +448,7 @@ void PollCommands()
     if(pos == -1)
         return;
     pos += StringLen(marker);
-    // Avan e7ar at e9 '[']
+    // Avane7ar ate9 '[']
     while(pos < StringLen(response) && StringGetCharacter(response, pos) != '[') pos++;
     if(pos >= StringLen(response)) return;
     // Entrar no array
@@ -505,6 +529,107 @@ bool ParseOptionSymbols()
 
     return (g_option_symbols_count > 0);
 }
+
+//+------------------------------------------------------------------+
+//| Utilitários de descoberta automática de opções                   |
+//+------------------------------------------------------------------+
+string StripTrailingDigits(string s)
+{
+    int n = StringLen(s);
+    while(n > 0)
+    {
+        ushort ch = StringGetCharacter(s, n-1);
+        if(ch >= '0' && ch <= '9') n--; else break;
+    }
+    return StringSubstr(s, 0, n);
+}
+
+bool IsOptionSeriesLetter(ushort ch)
+{
+    // Séries CALL: A-L, PUT: M-X
+    return ((ch >= 'A' && ch <= 'L') || (ch >= 'M' && ch <= 'X'));
+}
+
+bool StartsWith(string s, string prefix)
+{
+    int lp = StringLen(prefix);
+    if(StringLen(s) < lp) return false;
+    return StringSubstr(s, 0, lp) == prefix;
+}
+
+bool ContainsSymbol(string &arr[], int count, string sym)
+{
+    for(int i = 0; i < count; i++) if(arr[i] == sym) return true;
+    return false;
+}
+
+bool AutoDiscoverOptionSymbols()
+{
+    // Descobre símbolos no MarketWatch que pareçam opções dos ativos-base monitorados
+    int total = SymbolsTotal(true); // apenas MarketWatch
+    if(total <= 0) return false;
+
+    // Construir lista de bases (ticker sem sufixo numérico)
+    string bases[];
+    int bases_count = 0;
+    ArrayResize(bases, g_symbols_count);
+    for(int i = 0; i < g_symbols_count; i++)
+    {
+        bases[i] = StripTrailingDigits(g_symbols[i]);
+        bases_count++;
+    }
+
+    // Colecionar candidatos
+    string found[];
+    int found_count = 0;
+
+    for(int i = 0; i < total; i++)
+    {
+        string sym = SymbolName(i, true);
+        if(sym == "") continue;
+
+        // Testar contra cada base
+        for(int b = 0; b < bases_count; b++)
+        {
+            string base = bases[b];
+            if(base == "") continue;
+            int lb = StringLen(base);
+            if(StringLen(sym) <= lb) continue;
+            if(!StartsWith(sym, base)) continue;
+            ushort ch = StringGetCharacter(sym, lb);
+            if(!IsOptionSeriesLetter(ch)) continue;
+
+            if(!ContainsSymbol(found, found_count, sym))
+            {
+                // Limite de proteção
+                if(found_count >= InpMaxAutoOptionSymbols)
+                {
+                    Print("AVISO: Limite de auto-descoberta atingido (", InpMaxAutoOptionSymbols, ")");
+                    break;
+                }
+                ArrayResize(found, found_count + 1);
+                found[found_count] = sym;
+                found_count++;
+            }
+        }
+        if(found_count >= InpMaxAutoOptionSymbols) break;
+    }
+
+    if(found_count == 0) return false;
+
+    // Atualizar lista global
+    ArrayFree(g_option_symbols);
+    g_option_symbols_count = 0;
+    ArrayResize(g_option_symbols, found_count);
+    for(int j = 0; j < found_count; j++)
+    {
+        g_option_symbols[j] = found[j];
+        g_option_symbols_count++;
+    }
+
+    return (g_option_symbols_count > 0);
+}
+
 
 //+------------------------------------------------------------------+
 //| Envia cotações de opções para o backend                         |

@@ -50,17 +50,42 @@ class RollCalculator:
         if market_data is None:
             market_data = await self._get_live_market_data(position, auth_user_id)
 
+        # Normalize market data and handle absence gracefully
+        safe_md = market_data or {}
+        try:
+            cur_px = float(safe_md.get("current_price") or 0)
+        except Exception:
+            cur_px = 0.0
+
+        if cur_px <= 0:
+            # Sem dado de preço atual: não geramos sugestões, mas retornamos métricas básicas
+            current_metrics = self._calculate_position_metrics(position, safe_md)
+            logger.info(
+                "Roll preview generated (no market data)",
+                position_id=str(position_id),
+                suggestions_count=0,
+            )
+            return {
+                "current_position": {
+                    **position,
+                    **current_metrics,
+                },
+                "suggestions": [],
+                "market_data": safe_md,
+                "rule_used": rule,
+            }
+
         # Generate suggestions
         suggestions = await self._generate_suggestions(
             position,
             rule,
-            market_data
+            safe_md,
         )
 
         # Calculate current position metrics
         current_metrics = self._calculate_position_metrics(
             position,
-            market_data
+            safe_md,
         )
 
         logger.info(
@@ -75,7 +100,7 @@ class RollCalculator:
                 **current_metrics
             },
             "suggestions": suggestions,
-            "market_data": market_data,
+            "market_data": safe_md,
             "rule_used": rule
         }
 
@@ -299,21 +324,27 @@ class RollCalculator:
         Returns:
             Metrics dict
         """
-        current_price = market_data.get("current_price", 0)
+        current_price = float((market_data or {}).get("current_price") or 0)
         strike = float(position.get("strike", 0))
         side = position.get("side", "CALL")
 
         # Calculate DTE
         dte = self._calculate_dte(position.get("expiration"))
 
-        # Calculate OTM percentage
-        otm_pct = abs(strike - current_price) / current_price * 100
-
-        # Determine if ITM or OTM
-        if side == "CALL":
-            is_itm = current_price > strike
+        # Calculate OTM percentage (evitar divisão por zero)
+        if current_price > 0:
+            otm_pct = abs(strike - current_price) / current_price * 100
         else:
-            is_itm = current_price < strike
+            otm_pct = None
+
+        # Determine if ITM or OTM (somente se houver preço)
+        if current_price > 0:
+            if side == "CALL":
+                is_itm = current_price > strike
+            else:
+                is_itm = current_price < strike
+        else:
+            is_itm = None
 
         # Calculate P&L
         avg_premium = float(position.get("avg_premium", 0))
@@ -322,7 +353,7 @@ class RollCalculator:
         # Current value (market mid when available)
         current_premium = None
         try:
-            ticker = market_data.get("ticker") or position.get("ticker")
+            ticker = (market_data or {}).get("ticker") or position.get("ticker")
             if ticker:
                 from MT5.storage import get_latest_option_quote
                 q = get_latest_option_quote(
@@ -348,11 +379,11 @@ class RollCalculator:
 
         return {
             "dte": dte,
-            "otm_pct": round(otm_pct, 2),
+            "otm_pct": (round(otm_pct, 2) if otm_pct is not None else None),
             "is_itm": is_itm,
             "current_premium": round(current_premium, 2),
             "pnl": round(pnl, 2),
-            "current_price": current_price
+            "current_price": round(current_price, 2),
         }
 
     def _calculate_dte(self, expiration) -> int:

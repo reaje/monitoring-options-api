@@ -417,3 +417,38 @@ def record_execution_report(report: Dict[str, Any]) -> None:
             # ACCEPTED / PARTIAL / etc.
             c["status"] = status or c.get("status")
         c["updated_at"] = now_iso
+
+
+
+# ----- Helpers to fetch commands for UI -----
+from typing import Optional as _Optional
+
+def get_command_by_id(command_id: str) -> _Optional[Dict[str, Any]]:
+    cid = str(command_id or "").strip()
+    if not cid:
+        return None
+    with _lock:
+        cmd = _COMMANDS.get(cid)
+        return dict(cmd) if cmd else None
+
+
+def list_commands(created_by: _Optional[str] = None, limit: int = 50) -> list[Dict[str, Any]]:
+    """List commands (optionally filtered by creator), newest first.
+    WARNING: in-memory only; for production use DB persistence.
+    """
+    with _lock:
+        items = list(_COMMANDS.values())
+        if created_by:
+            uid = str(created_by).strip()
+            items = [c for c in items if str(c.get("created_by") or "") == uid]
+        # sort by created_at desc
+        def _ts(c: Dict[str, Any]):
+            try:
+                ts = c.get("created_at")
+                if isinstance(ts, str) and ts.endswith("Z"):
+                    ts = ts[:-1] + "+00:00"
+                return datetime.fromisoformat(ts).timestamp()
+            except Exception:
+                return 0.0
+        items.sort(key=_ts, reverse=True)
+        return [dict(c) for c in items[: max(1, int(limit))]]
