@@ -175,6 +175,74 @@ public:
     }
 
     //+------------------------------------------------------------------+
+    //| Extrai valor double de JSON simples (busca por chave)            |
+    //+------------------------------------------------------------------+
+    static double ExtractDoubleValue(string json, string key)
+    {
+        string search = "\"" + key + "\":";
+        int start = StringFind(json, search);
+        if(start == -1)
+            return 0.0;
+        start += StringLen(search);
+        // Pula espaços em branco
+        while(start < StringLen(json))
+        {
+            ushort ch = StringGetCharacter(json, start);
+            if(ch != ' ' && ch != '\t')
+                break;
+            start++;
+        }
+        // Encontra o fim do número (inclui ponto decimal e sinal)
+        int end = start;
+        while(end < StringLen(json))
+        {
+            ushort ch = StringGetCharacter(json, end);
+            if(!((ch >= '0' && ch <= '9') || ch == '.' || ch == '-'))
+                break;
+            end++;
+        }
+        if(end <= start)
+            return 0.0;
+        string value = StringSubstr(json, start, end - start);
+        return StringToDouble(value);
+    }
+
+    //+------------------------------------------------------------------+
+    //| Extrai objeto JSON (como substring) por chave                     |
+    //+------------------------------------------------------------------+
+    static string ExtractObject(string json, string key)
+    {
+        string search = "\"" + key + "\":";
+        int pos = StringFind(json, search);
+        if(pos == -1)
+            return "";
+        // Encontrar início do objeto '{'
+        pos = pos + StringLen(search);
+        while(pos < StringLen(json) && StringGetCharacter(json, pos) != '{')
+            pos++;
+        if(pos >= StringLen(json))
+            return "";
+        int start = pos;
+        int depth = 0;
+        for(int i = pos; i < StringLen(json); i++)
+        {
+            ushort ch = StringGetCharacter(json, i);
+            if(ch == '{') depth++;
+            if(ch == '}')
+            {
+                depth--;
+                if(depth == 0)
+                {
+                    int end = i;
+                    return StringSubstr(json, start, end - start + 1);
+                }
+            }
+        }
+        return "";
+    }
+
+
+    //+------------------------------------------------------------------+
     //| Verifica se JSON contém array vazio para determinada chave      |
     //+------------------------------------------------------------------+
     static bool HasEmptyArray(string json, string key)

@@ -13,6 +13,8 @@
 #include "HttpClient.mqh"
 #include "JsonHelper.mqh"
 
+#include <Trade/Trade.mqh>  // Execução de ordens
+
 //--- Inputs configuráveis
 //=== Configurações do Servidor ===
 input string    InpBackendUrl = "http://localhost:8000";     // URL do Backend (sem / no final)
@@ -46,6 +48,8 @@ datetime        g_last_quotes = 0;
 datetime        g_last_option_quotes = 0;
 datetime        g_last_commands_poll = 0;
 string          g_account_number;
+CTrade          g_trade;  // handler de ordens de mercado
+
 int             g_terminal_build;
 bool            g_initialized = false;
 
@@ -407,18 +411,53 @@ void PollCommands()
         return;
     }
 
-    // Verificar se há comandos (Fase 1: sempre retorna array vazio)
+    // Verificar se h e1 comandos
     if(CJsonHelper::HasEmptyArray(response, "commands"))
     {
         // Sem comandos pendentes
         return;
     }
 
-    if(InpEnableLogging)
-        Print("Comandos recebidos: ", response);
+    // Localizar array de comandos
+    string marker = "\"commands\":";
+    int pos = StringFind(response, marker);
+    if(pos == -1)
+        return;
+    pos += StringLen(marker);
+    // Avan e7ar at e9 '[']
+    while(pos < StringLen(response) && StringGetCharacter(response, pos) != '[') pos++;
+    if(pos >= StringLen(response)) return;
+    // Entrar no array
+    pos++;
 
-    // TODO: Fase 3 - Processar comandos recebidos
-    // Por enquanto, apenas loga
+    int depth = 0;
+    int start = -1;
+    for(int i = pos; i < StringLen(response); i++)
+    {
+        ushort ch = StringGetCharacter(response, i);
+        if(ch == '{')
+        {
+            if(depth == 0)
+                start = i;
+            depth++;
+        }
+        else if(ch == '}')
+        {
+            depth--;
+            if(depth == 0 && start != -1)
+            {
+                int end = i;
+                string cmd_json = StringSubstr(response, start, end - start + 1);
+                ProcessCommand(cmd_json);
+                start = -1;
+            }
+        }
+        else if(ch == ']')
+        {
+            // Fim do array
+            break;
+        }
+    }
 }
 
 //+------------------------------------------------------------------+
@@ -494,6 +533,7 @@ void SendOptionQuotes()
             continue;
         }
 
+
         // Obter volume do tick
         long volume = (long)tick.volume;
 
@@ -533,6 +573,138 @@ void SendOptionQuotes()
         Print("ERRO: Falha ao enviar cotações de opções!");
     }
 }
+
+//+------------------------------------------------------------------+
+//| Processamento de comandos MT5                                   |
+//+------------------------------------------------------------------+
+
+bool SendExecutionReportSimple(string command_id, string status, string order_id, double filled_qty, double avg_price, string message)
+{
+    if(g_http_client == NULL) return false;
+    string json = CJsonHelper::CreateExecutionReport(command_id, status, order_id, filled_qty, avg_price, message);
+    string resp;
+    bool ok = g_http_client.Post("/api/mt5/execution_report", json, resp);
+    if(InpEnableLogging)
+        Print("ExecutionReport[", status, "] -> ", ok, ", resp=", resp);
+    return ok;
+}
+
+string EncodeOptionSymbol(string ticker, double strike, string option_type, string expiration)
+{
+    // Remove sufixo numérico do ticker (VALE3 -> VALE)
+    string base = ticker;
+    while(StringLen(base) > 0 && StringGetCharacter(base, StringLen(base)-1) >= '0' && StringGetCharacter(base, StringLen(base)-1) <= '9')
+        base = StringSubstr(base, 0, StringLen(base)-1);
+
+    // Extrair mês de YYYY-MM-DD
+    int month = 1;
+    if(StringLen(expiration) >= 7)
+        month = (int)StringToInteger(StringSubstr(expiration, 5, 2));
+
+    // Letra do mês
+    string type = StringToLower(option_type);
+    ushort code_char;
+    if(type == "call")
+        code_char = (ushort)('A' + (month - 1));
+    else
+        code_char = (ushort)('M' + (month - 1));
+
+    // Strike code (heurística similar ao backend)
+    int strike_code = (strike < 10.0) ? (int)MathRound(strike * 100.0) : (int)MathRound(strike * 2.0);
+
+    return base + (string)CharToString(code_char) + IntegerToString(strike_code);
+}
+
+bool ExecuteLeg(string command_id, string leg_json, string &order_id, double &filled_qty, double &avg_price, string &err)
+{
+    order_id = ""; filled_qty = 0; avg_price = 0.0; err = "";
+    if(leg_json == "") { err = "leg vazio"; return false; }
+
+    string ticker = CJsonHelper::ExtractStringValue(leg_json, "ticker");
+    double strike = CJsonHelper::ExtractDoubleValue(leg_json, "strike");
+    string option_type = CJsonHelper::ExtractStringValue(leg_json, "option_type");
+    string expiration = CJsonHelper::ExtractStringValue(leg_json, "expiration");
+    int quantity = CJsonHelper::ExtractIntValue(leg_json, "quantity");
+    string action = CJsonHelper::ExtractStringValue(leg_json, "action");
+
+    if(ticker == "" || strike <= 0 || expiration == "" || quantity <= 0) { err = "dados insuficientes na leg"; return false; }
+
+    string symbol = EncodeOptionSymbol(ticker, strike, option_type, expiration);
+
+    if(!SymbolSelect(symbol, true)) { err = "SymbolSelect falhou: " + symbol; return false; }
+
+    MqlTick tick; if(!SymbolInfoTick(symbol, tick)) { err = "Tick indisponível para " + symbol; return false; }
+
+    // Volume em contratos (assume 1 contrato = 1 lote)
+    double volume = (double)quantity;
+
+    bool ok = false;
+    if(action == "BUY_TO_CLOSE")
+        ok = g_trade.Buy(volume, symbol);
+    else if(action == "SELL_TO_OPEN")
+        ok = g_trade.Sell(volume, symbol);
+    else { err = "Ação desconhecida: " + action; return false; }
+
+    if(!ok)
+    {
+        err = g_trade.ResultRetcodeDescription();
+        return false;
+    }
+
+    order_id = IntegerToString((long)g_trade.ResultOrder());
+    avg_price = g_trade.ResultPrice();
+    filled_qty = volume;
+
+    return true;
+}
+
+void ProcessRollCommand(string cmd_json, string cmd_id)
+{
+    // Executa perna de fechamento e abertura em sequência
+    string leg_close = CJsonHelper::ExtractObject(cmd_json, "close_leg");
+    string leg_open = CJsonHelper::ExtractObject(cmd_json, "open_leg");
+
+    string order_id; double filled; double price; string err;
+
+    if(!ExecuteLeg(cmd_id, leg_close, order_id, filled, price, err))
+    {
+        SendExecutionReportSimple(cmd_id, "REJECTED", "", 0.0, 0.0, "close_leg: " + err);
+        return;
+    }
+
+    // Reportar sucesso da primeira perna (parcial)
+    SendExecutionReportSimple(cmd_id, "PARTIAL", order_id, filled, price, "close_leg ok");
+
+    if(!ExecuteLeg(cmd_id, leg_open, order_id, filled, price, err))
+    {
+        SendExecutionReportSimple(cmd_id, "FAILED", "", 0.0, 0.0, "open_leg: " + err);
+        return;
+    }
+
+    // Ambas pernas concluídas
+    SendExecutionReportSimple(cmd_id, "FILLED", order_id, filled, price, "");
+}
+
+void ProcessCommand(string cmd_json)
+{
+    string cmd_id = CJsonHelper::ExtractStringValue(cmd_json, "id");
+    string type = CJsonHelper::ExtractStringValue(cmd_json, "type");
+    if(cmd_id == "" || type == "") return;
+
+    // Notificar aceitação para evitar redespacho
+    SendExecutionReportSimple(cmd_id, "ACCEPTED", "", 0.0, 0.0, "");
+
+    if(type == "ROLL_POSITION")
+    {
+        ProcessRollCommand(cmd_json, cmd_id);
+    }
+    else
+    {
+        // Tipo não suportado
+        SendExecutionReportSimple(cmd_id, "REJECTED", "", 0.0, 0.0, "tipo não suportado: " + type);
+    }
+}
+
 
 //+------------------------------------------------------------------+
 //| Retorna descrição do motivo de deinicialização                  |

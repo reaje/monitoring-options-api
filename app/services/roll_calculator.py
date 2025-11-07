@@ -3,6 +3,7 @@
 from typing import List, Dict, Any, Optional
 from uuid import UUID
 from datetime import datetime, date, timedelta
+from calendar import monthrange
 from app.database.repositories.options import OptionsRepository
 from app.database.repositories.rules import RulesRepository
 from app.core.logger import logger
@@ -45,9 +46,9 @@ class RollCalculator:
         # Use first rule or defaults
         rule = rules[0] if rules else self._get_default_rule()
 
-        # Get current market data (or mock)
+        # Get current market data (preferir dados ao vivo via MT5; sem mocks)
         if market_data is None:
-            market_data = self._get_mock_market_data(position)
+            market_data = await self._get_live_market_data(position, auth_user_id)
 
         # Generate suggestions
         suggestions = await self._generate_suggestions(
@@ -85,127 +86,144 @@ class RollCalculator:
         market_data: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
         """
-        Generate roll suggestions based on rules and market data.
-
-        Args:
-            position: Current position
-            rule: Roll rule configuration
-            market_data: Market data
-
-        Returns:
-            List of roll suggestions sorted by score
+        Gerar sugestões de rolagem com dados reais do MT5 (sem mocks).
         """
-        suggestions = []
+        suggestions: List[Dict[str, Any]] = []
 
-        current_price = market_data.get("current_price", 0)
-        current_strike = float(position.get("strike", 0))
-        side = position.get("side", "CALL")
+        current_price = float(market_data.get("current_price") or 0)
+        if current_price <= 0:
+            return suggestions
 
-        # Get target OTM percentages from rule
+        current_strike = float(position.get("strike", 0) or 0)
+        side = str(position.get("side") or "CALL").upper()
+        option_type = "call" if side == "CALL" else "put"
+
+        # Ticker do ativo
+        ticker = market_data.get("ticker") or position.get("ticker")
+        if not ticker:
+            # Sem ticker não há como buscar cadeia
+            return suggestions
+
+        # Alvos de OTM (%)
         otm_low = float(rule.get("target_otm_pct_low", 0.03))
         otm_high = float(rule.get("target_otm_pct_high", 0.08))
 
-        # Get DTE range from rule
-        dte_min = rule.get("dte_min", 21)
-        dte_max = rule.get("dte_max", 45)
+        # Faixa de DTE
+        dte_min = int(rule.get("dte_min", 21))
+        dte_max = int(rule.get("dte_max", 45))
 
-        # Calculate target strike range
+        # Faixa de strikes alvo (em preço absoluto)
         if side == "CALL":
-            # For CALL, OTM means above current price
             strike_low = current_price * (1 + otm_low)
             strike_high = current_price * (1 + otm_high)
-        else:  # PUT
-            # For PUT, OTM means below current price
+        else:
             strike_low = current_price * (1 - otm_high)
             strike_high = current_price * (1 - otm_low)
 
-        # Generate suggestion grid
-        # In production, this would fetch real options chain
-        strike_increments = [0.03, 0.05, 0.08, 0.10, 0.12]
-        # Build DTE options dynamically from rule range
+        # Custo de recompra da perna atual (mid do book)
         try:
-            _dte_min = int(dte_min)
-            _dte_max = int(dte_max)
-            if _dte_min > _dte_max:
-                _dte_min, _dte_max = _dte_max, _dte_min
+            from MT5.storage import get_latest_option_quote
+            buyback_q = get_latest_option_quote(
+                ticker=ticker,
+                strike=current_strike,
+                expiration=str(position.get("expiration")),
+                option_type=option_type,
+            )
+            buyback_mid = None
+            if buyback_q:
+                b_bid = float(buyback_q.get("bid") or 0)
+                b_ask = float(buyback_q.get("ask") or 0)
+                b_last = float(buyback_q.get("last") or 0)
+                buyback_mid = (b_bid + b_ask) / 2 if (b_bid and b_ask) else (b_last or b_bid or b_ask)
         except Exception:
-            _dte_min, _dte_max = 21, 45
-        span = max(0, _dte_max - _dte_min)
-        if span <= 0:
-            dte_options = [_dte_min]
-        else:
-            import math as _math
-            step = max(1, _math.ceil(span / 4))
-            dte_options = list(range(_dte_min, _dte_max + 1, step))
-            if _dte_max not in dte_options:
-                dte_options.append(_dte_max)
+            buyback_mid = None
 
-        for dte in dte_options:
+        if buyback_mid is None:
+            # Sem preço de recompra confiável não geramos sugestões
+            return suggestions
+
+        # Candidatos de vencimento (3ª sexta) dentro da janela de DTE
+        candidate_exps = self._candidate_expirations_in_range(dte_min, dte_max)
+        if not candidate_exps:
+            return suggestions
+
+        # Buscar cadeia de opções recente do cache do MT5
+        try:
+            from MT5.storage import get_all_option_quotes
+            all_opts = get_all_option_quotes(max_age_seconds=180)
+        except Exception:
+            all_opts = {}
+
+        # Filtrar por ticker, tipo, vencimento e strike dentro da faixa alvo
+        from datetime import date as _date
+        today = _date.today()
+        for entry in all_opts.values():
+            if (entry.get("ticker") or "").upper() != ticker.upper():
+                continue
+            if (entry.get("option_type") or "").lower() != option_type:
+                continue
+            exp = str(entry.get("expiration") or "")
+            if exp not in candidate_exps:
+                continue
+            strike = float(entry.get("strike") or 0)
+            if strike <= 0:
+                continue
+            if not (min(strike_low, strike_high) <= strike <= max(strike_low, strike_high)):
+                continue
+
+            bid = float(entry.get("bid") or 0)
+            ask = float(entry.get("ask") or 0)
+            last = float(entry.get("last") or 0)
+            mid = (bid + ask) / 2 if (bid and ask) else (last or bid or ask)
+            if not mid or mid <= 0:
+                continue
+
+            # DTE real do vencimento
+            try:
+                dte = (datetime.fromisoformat(exp).date() - today).days
+            except Exception:
+                dte = 0
             if dte < dte_min or dte > dte_max:
                 continue
 
-            expiration = (date.today() + timedelta(days=dte)).isoformat()
+            # OTM % relativo ao subjacente
+            otm_pct = abs(strike - current_price) / current_price
 
-            for increment in strike_increments:
-                if side == "CALL":
-                    new_strike = current_price * (1 + increment)
-                else:
-                    new_strike = current_price * (1 - increment)
+            net_credit = mid - buyback_mid
 
-                # Check if strike is in target range
-                if not (strike_low <= new_strike <= strike_high):
-                    continue
+            # Spread % quando disponível
+            spread = None
+            if bid and ask and mid:
+                try:
+                    spread = (ask - bid) / mid
+                except Exception:
+                    spread = None
 
-                # Calculate OTM percentage
-                otm_pct = abs(new_strike - current_price) / current_price
+            score = self._calculate_suggestion_score(
+                otm_pct,
+                net_credit,
+                dte,
+                rule,
+            )
 
-                # Mock option data (in production, fetch from market)
-                premium = self._estimate_premium(
-                    current_price,
-                    new_strike,
-                    dte,
-                    side
-                )
+            suggestions.append({
+                "strike": round(strike, 2),
+                "expiration": exp,
+                "dte": int(dte),
+                "otm_pct": round(otm_pct * 100, 2),
+                "premium": round(mid, 2),
+                "net_credit": round(net_credit, 2),
+                "spread": round(spread, 4) if spread is not None else None,
+                "volume": entry.get("volume"),
+                "oi": None,
+                "score": round(score, 2),
+            })
 
-                # Calculate net credit (new premium - buyback cost)
-                # Assuming buyback at current premium estimate
-                buyback_cost = self._estimate_premium(
-                    current_price,
-                    current_strike,
-                    self._calculate_dte(position.get("expiration")),
-                    side
-                )
-
-                net_credit = premium - buyback_cost
-
-                # Calculate score
-                score = self._calculate_suggestion_score(
-                    otm_pct,
-                    net_credit,
-                    dte,
-                    rule
-                )
-
-                suggestion = {
-                    "strike": round(new_strike, 2),
-                    "expiration": expiration,
-                    "dte": dte,
-                    "otm_pct": round(otm_pct * 100, 2),
-                    "premium": round(premium, 2),
-                    "net_credit": round(net_credit, 2),
-                    "spread": 0.02,  # Mock 2% spread
-                    "volume": 5000,  # Mock volume
-                    "oi": 10000,  # Mock open interest
-                    "score": round(score, 2)
-                }
-
-                suggestions.append(suggestion)
-
-        # Sort by score (highest first)
         suggestions.sort(key=lambda x: x["score"], reverse=True)
-
-        # Return top 5 suggestions
         return suggestions[:5]
+
+
+
 
     def _calculate_suggestion_score(
         self,
@@ -237,6 +255,7 @@ class RollCalculator:
 
         # Reward OTM in target range (30 points max)
         target_otm_low = rule.get("target_otm_pct_low", 0.03)
+
         target_otm_high = rule.get("target_otm_pct_high", 0.08)
         target_otm = (target_otm_low + target_otm_high) / 2
 
@@ -250,6 +269,8 @@ class RollCalculator:
         target_dte = (dte_min + dte_max) / 2
 
         dte_distance = abs(dte - target_dte)
+
+
         dte_score = max(0, 20 - (dte_distance / 2))
         score += dte_score
 
@@ -258,48 +279,10 @@ class RollCalculator:
 
         return score
 
-    def _estimate_premium(
-        self,
-        current_price: float,
-        strike: float,
-        dte: int,
-        side: str
-    ) -> float:
-        """
-        Estimate option premium (mock calculation).
 
-        In production, this would use Black-Scholes or fetch from market.
 
-        Args:
-            current_price: Current underlying price
-            strike: Strike price
-            dte: Days to expiration
-            side: CALL or PUT
 
-        Returns:
-            Estimated premium
-        """
-        # Very simplified mock calculation
-        # Real implementation would use Black-Scholes or market data
 
-        # Calculate intrinsic value
-        if side == "CALL":
-            intrinsic = max(0, current_price - strike)
-        else:
-            intrinsic = max(0, strike - current_price)
-
-        # Estimate time value (very simplified)
-        time_value = current_price * 0.02 * (dte / 30) * 0.3
-
-        # Add some randomness for OTM options
-        if intrinsic == 0:
-            # OTM option - mainly time value
-            otm_distance = abs(strike - current_price) / current_price
-            time_value *= (1 - otm_distance)
-
-        premium = intrinsic + time_value
-
-        return max(premium, 0.01)  # Minimum 0.01
 
     def _calculate_position_metrics(
         self,
@@ -336,13 +319,29 @@ class RollCalculator:
         avg_premium = float(position.get("avg_premium", 0))
         quantity = int(position.get("quantity", 0))
 
-        # Current value (estimated)
-        current_premium = self._estimate_premium(
-            current_price,
-            strike,
-            dte,
-            side
-        )
+        # Current value (market mid when available)
+        current_premium = None
+        try:
+            ticker = market_data.get("ticker") or position.get("ticker")
+            if ticker:
+                from MT5.storage import get_latest_option_quote
+                q = get_latest_option_quote(
+                    ticker=ticker,
+                    strike=strike,
+                    expiration=str(position.get("expiration")),
+                    option_type=("call" if side == "CALL" else "put"),
+                )
+                if q:
+                    b = float(q.get("bid") or 0)
+                    a = float(q.get("ask") or 0)
+                    l = float(q.get("last") or 0)
+                    m = (b + a) / 2 if (b and a) else (l or b or a)
+                    if m and m > 0:
+                        current_premium = m
+        except Exception:
+            pass
+        if current_premium is None:
+            current_premium = 0.0
 
         # P&L = (premium received - current value) * quantity * 100
         pnl = (avg_premium - current_premium) * quantity * 100
@@ -366,30 +365,47 @@ class RollCalculator:
         today = date.today()
         return (expiration - today).days
 
-    def _get_mock_market_data(self, position: Dict[str, Any]) -> Dict[str, Any]:
+
+    async def _get_live_market_data(self, position: Dict[str, Any], auth_user_id: Optional[UUID] = None) -> Optional[Dict[str, Any]]:
         """
-        Get mock market data for testing.
-
-        Args:
-            position: Position dict
-
-        Returns:
-            Mock market data
+        Busca dado de mercado ao vivo do subjacente via MT5.storage.
+        Retorna None se indisponível.
         """
-        _strike = position.get("strike", 100)
-        strike = float(_strike if _strike is not None else 100)
+        try:
+            from MT5.storage import get_latest_quote
+            from app.database.repositories.assets import AssetsRepository
+        except Exception:
+            return None
+        try:
+            ticker = position.get("ticker")
+            if not ticker:
+                asset_id = position.get("asset_id")
+                if asset_id:
+                    asset = await AssetsRepository.get_by_id(UUID(str(asset_id)), auth_user_id=auth_user_id)
+                    if asset:
+                        ticker = asset.get("ticker")
+            if not ticker:
+                return None
+            q = get_latest_quote(ticker)
+            if not q:
+                return None
+            bid = float(q.get("bid") or 0)
+            ask = float(q.get("ask") or 0)
+            last = float(q.get("last") or 0)
+            mid = (bid + ask) / 2 if (bid and ask) else (last or bid or ask)
+            if not mid or mid <= 0:
+                return None
+            return {
+                "ticker": ticker,
+                "current_price": round(mid, 2),
+                "bid": bid or None,
+                "ask": ask or None,
+                "volume": q.get("volume"),
+                "timestamp": q.get("ts") or q.get("timestamp"),
+            }
+        except Exception:
+            return None
 
-        # Mock current price near strike
-        current_price = strike * 0.98  # Slightly below strike for CALL
-
-        return {
-            "ticker": position.get("ticker", "MOCK"),
-            "current_price": round(current_price, 2),
-            "bid": round(current_price * 0.999, 2),
-            "ask": round(current_price * 1.001, 2),
-            "volume": 1500000,
-            "timestamp": datetime.utcnow().isoformat()
-        }
 
     def _get_default_rule(self) -> Dict[str, Any]:
         """Get default rule configuration."""
@@ -403,6 +419,25 @@ class RollCalculator:
             "max_spread": 0.05,
             "min_oi": 5000
         }
+
+
+    def _candidate_expirations_in_range(self, dte_min: int, dte_max: int) -> List[str]:
+        """
+        Datas das terceiras sextas-feiras com DTE dentro do intervalo.
+        """
+        today = date.today()
+        candidates: List[str] = []
+        for moff in range(0, 12):
+            year = today.year + ((today.month - 1 + moff) // 12)
+            month = ((today.month - 1 + moff) % 12) + 1
+            first = date(year, month, 1)
+            first_wd = first.weekday()  # Monday=0 ... Sunday=6
+            offset_to_first_friday = (4 - first_wd + 7) % 7  # Friday=4
+            third_friday = first + timedelta(days=offset_to_first_friday + 14)
+            dte = (third_friday - today).days
+            if dte_min <= dte <= dte_max:
+                candidates.append(third_friday.isoformat())
+        return candidates
 
 
 # Singleton instance
