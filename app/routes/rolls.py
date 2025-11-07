@@ -60,6 +60,35 @@ async def get_roll_preview(request: Request):
         if not position:
             raise NotFoundError("Position", str(position_id))
 
+        # If no market_data provided, try MT5 live quote
+        if not market_data:
+            try:
+                from MT5.storage import get_latest_quote
+                from app.database.repositories.assets import AssetsRepository
+                ticker = position.get("ticker")
+                if not ticker:
+                    asset_id = UUID(position["asset_id"]) if not isinstance(position.get("asset_id"), UUID) else position["asset_id"]
+                    asset = await AssetsRepository.get_by_id(asset_id, auth_user_id=user_id)
+                    ticker = asset.get("ticker") if asset else None
+                if ticker:
+                    q = get_latest_quote(ticker)
+                    if q:
+                        bid = float(q.get("bid") or 0)
+                        ask = float(q.get("ask") or 0)
+                        last = float(q.get("last") or 0)
+                        mid = (bid + ask) / 2 if bid and ask else (last or bid or ask)
+                        if mid and mid > 0:
+                            market_data = {
+                                "ticker": ticker,
+                                "current_price": round(mid, 2),
+                                "bid": bid or None,
+                                "ask": ask or None,
+                                "volume": q.get("volume"),
+                                "timestamp": q.get("ts") or q.get("timestamp"),
+                            }
+            except Exception:
+                pass
+
         # Generate roll preview
         preview = await roll_calculator.get_roll_preview(
             position_id,
@@ -114,8 +143,37 @@ async def get_roll_suggestions(request: Request, position_id: UUID):
         if not position:
             raise NotFoundError("Position", position_id)
 
+        # Try to use live MT5 quote for current_price if available
+        market_data = None
+        try:
+            from MT5.storage import get_latest_quote
+            from app.database.repositories.assets import AssetsRepository
+            ticker = position.get("ticker")
+            if not ticker:
+                asset_id = UUID(position["asset_id"]) if not isinstance(position.get("asset_id"), UUID) else position["asset_id"]
+                asset = await AssetsRepository.get_by_id(asset_id, auth_user_id=user_id)
+                ticker = asset.get("ticker") if asset else None
+            if ticker:
+                q = get_latest_quote(ticker)
+                if q:
+                    bid = float(q.get("bid") or 0)
+                    ask = float(q.get("ask") or 0)
+                    last = float(q.get("last") or 0)
+                    mid = (bid + ask) / 2 if bid and ask else (last or bid or ask)
+                    if mid and mid > 0:
+                        market_data = {
+                            "ticker": ticker,
+                            "current_price": round(mid, 2),
+                            "bid": bid or None,
+                            "ask": ask or None,
+                            "volume": q.get("volume"),
+                            "timestamp": q.get("ts") or q.get("timestamp"),
+                        }
+        except Exception:
+            market_data = None
+
         # Generate preview
-        preview = await roll_calculator.get_roll_preview(position_uuid, auth_user_id=user_id)
+        preview = await roll_calculator.get_roll_preview(position_uuid, market_data, auth_user_id=user_id)
 
         # Return only suggestions
         return response.json(
@@ -226,3 +284,110 @@ async def get_account_roll_analysis(request: Request, account_id: UUID):
     except Exception as e:
         logger.error("Failed to get account roll analysis", error=str(e))
         raise ValidationError(f"Failed to get account roll analysis: {str(e)}")
+
+
+
+@rolls_bp.post("/mt5/execute")
+@openapi.tag("Rolls")
+@openapi.summary("Enfileira rolagem automática via MetaTrader 5")
+@openapi.secured("BearerAuth")
+@require_auth
+async def execute_roll_mt5(request: Request):
+    """
+    Enfileira uma rolagem (fechar opção atual e abrir nova) para execução no MT5.
+
+    Body esperado:
+    {
+      "option_position_id": "<uuid>",
+      "suggestion": { "strike": 0.0, "expiration": "YYYY-MM-DD" },
+      "min_net_credit": 0.0
+    }
+    """
+    from uuid import UUID as _UUID, uuid4 as _uuid4
+    from datetime import datetime as _dt
+    from MT5.storage import enqueue_command, get_all_heartbeats
+    from app.database.repositories.assets import AssetsRepository
+
+    user = request.ctx.user
+    user_id = UUID(user["id"])
+
+    if not getattr(__import__('app.config', fromlist=['settings']).config.settings, 'MT5_BRIDGE_ENABLED', False):
+        return response.json({"error": "mt5_bridge_disabled"}, status=403)
+
+    data = request.json or {}
+    try:
+        position_id = _UUID(str(data.get("option_position_id")))
+        suggestion = data.get("suggestion") or {}
+        target_strike = float(suggestion.get("strike"))
+        target_expiration = str(suggestion.get("expiration"))
+        min_net_credit = data.get("min_net_credit")
+    except Exception:
+        raise ValidationError("Payload inválido para execução de rolagem")
+
+    # Carrega posição e valida dono
+    position = await OptionsRepository.get_user_position(position_id, user_id)
+    if not position:
+        raise NotFoundError("Position", str(position_id))
+
+    account_id = _UUID(position["account_id"]) if not isinstance(position["account_id"], UUID) else position["account_id"]
+    asset_id = _UUID(position["asset_id"]) if not isinstance(position["asset_id"], UUID) else position["asset_id"]
+
+    account = await AccountsRepository.get_by_id(account_id, auth_user_id=user_id)
+    if not account:
+        raise AuthorizationError("Conta não encontrada ou sem permissão")
+
+    asset = await AssetsRepository.get_by_id(asset_id, auth_user_id=user_id)
+    ticker = asset.get("ticker") if asset else None
+    if not ticker:
+        raise ValidationError("Ticker do ativo não encontrado para a posição")
+
+    # Encontra terminal ativo para a conta via heartbeat recente
+    heartbeats = get_all_heartbeats(max_age_seconds=120)
+    terminal_id = None
+    for hb in heartbeats.values():
+        if str(hb.get("account_number")) == str(account.get("account_number")):
+            terminal_id = hb.get("terminal_id")
+            break
+    if not terminal_id:
+        return response.json({"error": "mt5_terminal_not_connected"}, status=412)
+
+    side_upper = str(position.get("side") or "").upper()
+    side_lower = "call" if side_upper == "CALL" else "put"
+    qty = int(position.get("quantity") or 0)
+
+    # Monta comando
+    cmd = {
+        "id": str(_uuid4()),
+        "type": "ROLL_POSITION",
+        "terminal_id": terminal_id,
+        "account_number": account.get("account_number"),
+        "position_id": str(position_id),
+        "timestamp": _dt.utcnow().isoformat() + "Z",
+        "close_leg": {
+            "ticker": ticker,
+            "strike": float(position.get("strike")),
+            "option_type": side_lower,
+            "expiration": str(position.get("expiration")),
+            "quantity": qty,
+            "action": "BUY_TO_CLOSE",
+        },
+        "open_leg": {
+            "ticker": ticker,
+            "strike": float(target_strike),
+            "option_type": side_lower,
+            "expiration": target_expiration,
+            "quantity": qty,
+            "action": "SELL_TO_OPEN",
+        },
+        "constraints": {
+            "min_net_credit": min_net_credit,
+            "time_in_force": data.get("time_in_force") or "DAY",
+        },
+        "status": "PENDING",
+        "created_by": str(user_id),
+    }
+
+    saved = enqueue_command(cmd)
+    logger.info("rolls.mt5.enqueue", command_id=saved["id"], terminal_id=terminal_id, position_id=str(position_id))
+
+    return response.json({"command": saved}, status=201)

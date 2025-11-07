@@ -17,9 +17,18 @@ from app.config import settings
 from typing import Any, Dict
 
 from app.core.logger import logger
-from .storage import upsert_heartbeat, upsert_quotes, upsert_option_quotes
+from .storage import (
+    upsert_heartbeat,
+    upsert_quotes,
+    upsert_option_quotes,
+    get_all_heartbeats,
+    get_all_quotes,
+    QUOTE_TTL_SECONDS,
+    get_pending_commands,
+    mark_commands_dispatched,
+    record_execution_report,
+)
 from datetime import datetime, timezone
-from .storage import get_all_heartbeats, get_all_quotes, QUOTE_TTL_SECONDS
 
 from .symbol_mapper import get_mapper
 
@@ -107,8 +116,20 @@ async def commands(request: Request):
     deny = _require_enabled_and_auth(request)
     if deny:
         return deny
-    # Fase 1: fila vazia
-    return response.json({"commands": []}, status=200)
+
+    terminal_id = request.args.get("terminal_id")
+    account_number = request.args.get("account_number")
+    max_count = int(request.args.get("max", 10))
+
+    try:
+        cmds = get_pending_commands(terminal_id=terminal_id, account_number=account_number, max_count=max_count)
+        # Opcional: marcar explicitamente como despachados (idempotente)
+        mark_commands_dispatched([c["id"] for c in cmds])
+        logger.info("mt5.commands.dispatch", count=len(cmds), terminal_id=terminal_id, account_number=account_number)
+        return response.json({"commands": cmds}, status=200)
+    except Exception as e:
+        logger.error("mt5.commands.error", error=str(e))
+        return response.json({"error": "server_error", "details": str(e)}, status=500)
 
 
 @mt5_bridge_bp.post("/option_quotes")
@@ -297,10 +318,14 @@ async def execution_report(request: Request):
     if deny:
         return deny
     payload: Dict[str, Any] = request.json or {}
-    logger.info(
-        "mt5.execution_report",
-        **{k: str(v) for k, v in payload.items() if k in ("command_id", "status", "order_id")},
-    )
-    # Fase 1: apenas loga
-    return response.json({"status": "ok"}, status=200)
+    try:
+        record_execution_report(payload)
+        logger.info(
+            "mt5.execution_report",
+            **{k: str(v) for k, v in payload.items() if k in ("command_id", "status", "order_id")},
+        )
+        return response.json({"status": "ok"}, status=200)
+    except Exception as e:
+        logger.error("mt5.execution_report.error", error=str(e))
+        return response.json({"error": "server_error", "details": str(e)}, status=500)
 

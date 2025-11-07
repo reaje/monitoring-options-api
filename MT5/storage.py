@@ -317,3 +317,103 @@ def _safe_float(v: Any) -> Optional[float]:
     except Exception:
         return None
 
+
+
+# -----------------------------
+# Commands queue (Fase 3)
+# -----------------------------
+from uuid import uuid4
+from typing import List
+
+# In-memory commands store
+_COMMANDS: Dict[str, Dict[str, Any]] = {}
+
+
+def enqueue_command(command: Dict[str, Any]) -> Dict[str, Any]:
+    """Enqueue a command for MT5 terminal execution.
+
+    Required fields in command:
+      - type: e.g., "ROLL_POSITION", "OPEN_POSITION", "CLOSE_POSITION"
+      - terminal_id
+      - account_number
+    """
+    now_iso = _utcnow_iso()
+    with _lock:
+        cmd = dict(command)
+        cmd_id = str(command.get("id") or uuid4())
+        cmd["id"] = cmd_id
+        cmd.setdefault("status", "PENDING")
+        cmd.setdefault("created_at", now_iso)
+        cmd["updated_at"] = now_iso
+        _COMMANDS[cmd_id] = cmd
+        return dict(cmd)
+
+
+def get_pending_commands(
+    terminal_id: Optional[str] = None,
+    account_number: Optional[str] = None,
+    max_count: int = 10,
+) -> List[Dict[str, Any]]:
+    """Return pending commands, filtered by terminal/account.
+
+    Marks returned commands with dispatched_at (idempotent).
+    """
+    now_iso = _utcnow_iso()
+    with _lock:
+        items = [c for c in _COMMANDS.values() if c.get("status") in ("PENDING", "RETRY")]
+        if terminal_id:
+            items = [c for c in items if (c.get("terminal_id") or "") == terminal_id]
+        if account_number:
+            items = [c for c in items if (c.get("account_number") or "") == account_number]
+        # Order by created_at
+        def _ts(c: Dict[str, Any]):
+            return _parse_ts_iso(c.get("created_at")).timestamp()
+        items.sort(key=_ts)
+        items = items[: max(1, int(max_count))]
+        # Mark as dispatched
+        for c in items:
+            if not c.get("dispatched_at"):
+                c["dispatched_at"] = now_iso
+                c["status"] = c.get("status", "PENDING")
+                c["updated_at"] = now_iso
+        return [dict(c) for c in items]
+
+
+def mark_commands_dispatched(ids: List[str]) -> None:
+    now_iso = _utcnow_iso()
+    with _lock:
+        for cid in ids:
+            c = _COMMANDS.get(cid)
+            if not c:
+                continue
+            c["dispatched_at"] = c.get("dispatched_at") or now_iso
+            c["updated_at"] = now_iso
+
+
+def record_execution_report(report: Dict[str, Any]) -> None:
+    """Record execution report from MT5 EA.
+
+    Expected keys: command_id, status, order_id(optional), details(optional)
+    """
+    now_iso = _utcnow_iso()
+    cid = str(report.get("command_id") or "").strip()
+    with _lock:
+        c = _COMMANDS.get(cid)
+        if not c:
+            # Create a placeholder for unknown command ids (so caller can audit)
+            _COMMANDS[cid] = {
+                "id": cid,
+                "status": report.get("status") or "UNKNOWN",
+                "last_report": report,
+                "updated_at": now_iso,
+            }
+            return
+        c["last_report"] = report
+        status = str(report.get("status") or "").upper()
+        if status in ("FILLED", "REJECTED", "CANCELLED"):
+            c["status"] = status
+            c["completed_at"] = now_iso
+        else:
+            # ACCEPTED / PARTIAL / etc.
+            c["status"] = status or c.get("status")
+        c["updated_at"] = now_iso
