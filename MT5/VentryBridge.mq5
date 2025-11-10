@@ -650,14 +650,21 @@ void SendOptionQuotes()
         string symbol = g_option_symbols[i];
         MqlTick tick;
 
+        // Garantir que o símbolo esteja selecionado (adicionado ao MarketWatch)
+        if(!SymbolSelect(symbol, true))
+        {
+            if(InpEnableLogging)
+                Print("AVISO: SymbolSelect falhou para opção ", symbol, ". Adicione ao MarketWatch.");
+            continue;
+        }
+
         // Obter último tick do símbolo
         if(!SymbolInfoTick(symbol, tick))
         {
             if(InpEnableLogging)
-                Print("AVISO: Não foi possível obter tick de opção ", symbol);
+                Print("AVISO: Tick indisponível para opção ", symbol);
             continue;
         }
-
 
         // Obter volume do tick
         long volume = (long)tick.volume;

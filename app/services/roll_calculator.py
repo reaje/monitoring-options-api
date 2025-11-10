@@ -7,6 +7,7 @@ from calendar import monthrange
 from app.database.repositories.options import OptionsRepository
 from app.database.repositories.rules import RulesRepository
 from app.core.logger import logger
+from app.services.market_data import market_data_provider
 
 
 class RollCalculator:
@@ -163,6 +164,22 @@ class RollCalculator:
         except Exception:
             buyback_mid = None
 
+        # Fallback: se não houver preço MT5 da perna atual, tenta provider híbrido (brapi/BS)
+        if buyback_mid is None:
+            try:
+                oq = await market_data_provider.get_option_quote(
+                    ticker=ticker,
+                    strike=current_strike,
+                    expiration=str(position.get("expiration")),
+                    option_type=option_type,
+                )
+                p_bid = float(oq.get("bid") or 0)
+                p_ask = float(oq.get("ask") or 0)
+                p_prem = float(oq.get("premium") or 0)
+                buyback_mid = (p_bid + p_ask) / 2 if (p_bid and p_ask) else (p_prem or p_bid or p_ask)
+            except Exception:
+                buyback_mid = None
+
         if buyback_mid is None:
             # Sem preço de recompra confiável não geramos sugestões
             return suggestions
@@ -243,6 +260,71 @@ class RollCalculator:
                 "oi": None,
                 "score": round(score, 2),
             })
+
+        # Fallback: se nada do MT5 gerou sugestão, estima prêmios via provider (BS/brapi)
+        if not suggestions:
+            def _round_to_05(x: float) -> float:
+                try:
+                    return round(x * 2) / 2.0
+                except Exception:
+                    return x
+
+            target_otm = (otm_low + otm_high) / 2.0
+            # Strike alvo (meio da faixa OTM)
+            if side == "CALL":
+                target_strike = _round_to_05(current_price * (1 + target_otm))
+            else:
+                target_strike = _round_to_05(current_price * (1 - target_otm))
+
+            for exp in candidate_exps[:3]:  # limitar para reduzir latência
+                try:
+                    oq = await market_data_provider.get_option_quote(
+                        ticker=ticker,
+                        strike=target_strike,
+                        expiration=exp,
+                        option_type=option_type,
+                    )
+                    b = float(oq.get("bid") or 0)
+                    a = float(oq.get("ask") or 0)
+                    prem = float(oq.get("premium") or 0)
+                    mid = (b + a) / 2 if (b and a) else (prem or b or a)
+                    if not mid or mid <= 0:
+                        continue
+
+                    # DTE
+                    try:
+                        dte = (datetime.fromisoformat(exp).date() - today).days
+                    except Exception:
+                        dte = 0
+                    if dte < dte_min or dte > dte_max:
+                        continue
+
+                    otm_pct = abs(target_strike - current_price) / current_price
+                    net_credit = mid - buyback_mid
+                    spread = None
+                    if b and a and mid:
+                        try:
+                            spread = (a - b) / mid
+                        except Exception:
+                            spread = None
+
+                    score = self._calculate_suggestion_score(otm_pct, net_credit, dte, rule)
+
+                    suggestions.append({
+                        "strike": round(target_strike, 2),
+                        "expiration": exp,
+                        "dte": int(dte),
+                        "otm_pct": round(otm_pct * 100, 2),
+                        "premium": round(mid, 2),
+                        "net_credit": round(net_credit, 2),
+                        "spread": round(spread, 4) if spread is not None else None,
+                        "volume": oq.get("volume"),
+                        "oi": None,
+                        "source": oq.get("source") or "fallback",
+                        "score": round(score, 2),
+                    })
+                except Exception:
+                    continue
 
         suggestions.sort(key=lambda x: x["score"], reverse=True)
         return suggestions[:5]

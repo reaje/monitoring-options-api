@@ -99,14 +99,15 @@ class MT5SymbolMapper:
         """
         mt5_symbol = mt5_symbol.strip().upper()
 
-        # Pattern: [TICKER][TYPE_CODE][STRIKE_DIGITS]
+        # Pattern: [TICKER][TYPE_CODE][STRIKE_DIGITS][OPTIONAL_SUFFIX]
         # Example: VALEC125 → VALE + C + 125
-        match = re.match(r'^([A-Z]{4,5})([A-X])(\d+)$', mt5_symbol)
+        # Aceita sufixos após os dígitos (ex.: "W1", "W2"): BBASK215W2, VALEK645W1
+        match = re.match(r'^([A-Z]{4,5})([A-X])(\d+)([A-Z0-9]*)$', mt5_symbol)
 
         if not match:
             raise ValueError(f"Invalid MT5 option symbol format: {mt5_symbol}")
 
-        ticker_base, type_code, strike_str = match.groups()
+        ticker_base, type_code, strike_str, _suffix = match.groups()
 
         # Determine option type and month
         if type_code in self.MONTH_CODES_CALL:
